@@ -2,6 +2,11 @@
 Flask and pywebview based software
 
 
+Folder Path "C:\Users\USER\Desktop\drone_updated"
+
+exe is in dist folder
+
+
 To Run, First create virtual env
 ``` python -m venv myenv```
 
