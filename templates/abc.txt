@@ -1,0 +1,4076 @@
+import sys
+import os
+import logging
+import traceback
+import json
+import shutil
+from functools import wraps
+from datetime import datetime
+
+# ==================== CLEANUP ON STARTUP ====================
+def cleanup_old_files():
+    """Remove old log files and uploads folder on startup"""
+    try:
+        # Get the directory where the executable is located
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Remove debug.log if it exists
+        debug_log = os.path.join(base_dir, 'debug.log')
+        if os.path.exists(debug_log):
+            try:
+                os.remove(debug_log)
+                print(f"Removed old debug.log from {base_dir}")
+            except Exception as e:
+                print(f"Could not remove debug.log: {e}")
+        
+        # Remove uploads folder if it exists (and is empty or old)
+        uploads_dir = os.path.join(base_dir, 'uploads')
+        if os.path.exists(uploads_dir):
+            try:
+                # Check if folder is empty or older than 1 day
+                should_remove = False
+                if not os.listdir(uploads_dir):
+                    should_remove = True  # Empty folder
+                else:
+                    # Check modification time
+                    mod_time = os.path.getmtime(uploads_dir)
+                    current_time = time.time()
+                    if (current_time - mod_time) > 86400:  # 24 hours in seconds
+                        should_remove = True
+                
+                if should_remove:
+                    shutil.rmtree(uploads_dir)
+                    print(f"Removed old uploads folder from {base_dir}")
+            except Exception as e:
+                print(f"Could not remove uploads folder: {e}")
+        
+        # Remove any .log files in the directory
+        for file in os.listdir(base_dir):
+            if file.endswith('.log'):
+                try:
+                    file_path = os.path.join(base_dir, file)
+                    os.remove(file_path)
+                    print(f"Removed log file: {file}")
+                except Exception as e:
+                    print(f"Could not remove {file}: {e}")
+                    
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+# Run cleanup before anything else
+cleanup_old_files()
+
+# Setup basic file logging immediately to catch startup errors
+try:
+    if getattr(sys, 'frozen', False):
+        log_path = os.path.join(os.path.dirname(sys.executable), 'debug.log')
+    else:
+        log_path = 'debug.log'
+    
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+except Exception:
+    pass  # If logging setup fails, just continue
+
+# Wrap imports in try/except to log import errors
+try:
+    from flask import Flask, render_template, request, jsonify, send_from_directory
+    import serial.tools.list_ports
+    import serial
+    import subprocess
+    import threading
+    import queue
+    import time
+    import atexit
+    from werkzeug.utils import secure_filename
+    import webview
+    
+    # Import stm32loader conditionally later to avoid startup crashes
+except Exception as e:
+    logging.error(f"Startup Import Error: {e}")
+    logging.error(traceback.format_exc())
+    sys.exit(1)
+
+# ==================== PATH HANDLING ====================
+if getattr(sys, 'frozen', False):
+    RESOURCE_DIR = sys._MEIPASS
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    RESOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = RESOURCE_DIR
+
+TEMPLATE_DIR = os.path.join(RESOURCE_DIR, 'templates')
+MODELS_DIR = os.path.join(RESOURCE_DIR, 'models')
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+
+# ==================== DISPATCHER LOGIC (FIX FOR NEW WINDOW) ====================
+if __name__ == '__main__':
+    # Check if we are being called as the uploader subprocess
+    if len(sys.argv) > 1 and sys.argv[1] == '--firmware-upload':
+        try:
+            # Clean arguments for stm32loader
+            sys.argv.pop(1)  # Remove the '--firmware-upload' flag
+            
+            # Import the main function from stm32loader dynamically
+            import stm32loader.main
+            
+            # Run the upload
+            stm32loader.main.main()
+            
+        except ImportError:
+            error_msg = "Error: stm32loader module not found in frozen bundle."
+            print(error_msg)
+            logging.error(error_msg)
+            sys.exit(1)
+        except Exception as e:
+            error_msg = f"Error executing stm32loader: {e}"
+            print(error_msg)
+            logging.error(error_msg)
+            logging.error(traceback.format_exc())
+            sys.exit(1)
+            
+        # Exit immediately so the GUI does not start
+        sys.exit(0)
+
+# ==================== NORMAL GUI APP STARTS HERE ====================
+
+# Configuration
+DEFAULT_BAUD_RATE = 57600
+MAX_FILE_SIZE = 16 * 1024 * 1024
+SERIAL_RECONNECT_ATTEMPTS = 3
+SERIAL_RECONNECT_DELAY = 2
+DEFAULT_LAT = 22.719568
+DEFAULT_LON = 75.857727
+DEFAULT_ZOOM = 15
+
+app = Flask(__name__, template_folder=TEMPLATE_DIR)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
+
+try:
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+except Exception as e:
+    logging.error(f"Failed to create upload folder: {e}")
+
+# Global State
+ser = None
+monitor_thread = None
+monitor_queue = queue.Queue()
+monitor_running = False
+monitor_lock = threading.Lock()
+current_port = None
+current_baud = DEFAULT_BAUD_RATE
+map_session = {
+    'lat': None, 'lon': None, 'altitude': None, 'speed': None,
+    'satellites': 0, 'hdop': 0.0, 'vdop': 0.0, 'fix_quality': 0,
+    'last_update': None, 'valid': False
+}
+map_track_history = []
+map_data_lock = threading.Lock()
+
+# Notification System State
+notification_history = []
+MAX_NOTIFICATION_HISTORY = 100
+app_start_time = time.time()  # Track app start time
+
+# ==================== CLEANUP ON SHUTDOWN ====================
+def cleanup_on_shutdown():
+    """Clean up files and folders when application shuts down"""
+    try:
+        logging.info("Starting shutdown cleanup...")
+        
+        # Remove uploads folder if empty
+        if os.path.exists(UPLOAD_FOLDER):
+            try:
+                if not os.listdir(UPLOAD_FOLDER):
+                    shutil.rmtree(UPLOAD_FOLDER)
+                    logging.info("Removed empty uploads folder")
+                else:
+                    # Check if files are older than 1 hour
+                    current_time = time.time()
+                    old_files = []
+                    for file in os.listdir(UPLOAD_FOLDER):
+                        file_path = os.path.join(UPLOAD_FOLDER, file)
+                        if os.path.isfile(file_path):
+                            mod_time = os.path.getmtime(file_path)
+                            if (current_time - mod_time) > 3600:  # 1 hour
+                                old_files.append(file_path)
+                    
+                    if old_files:
+                        for file_path in old_files:
+                            os.remove(file_path)
+                        logging.info(f"Removed {len(old_files)} old upload files")
+            except Exception as e:
+                logging.error(f"Error cleaning uploads folder: {e}")
+        
+        # Close serial connection
+        cleanup_serial()
+        
+        logging.info("Shutdown cleanup complete")
+        
+    except Exception as e:
+        logging.error(f"Error during shutdown cleanup: {e}")
+
+# ==================== DECORATORS ====================
+def api_response(success=True, message="", data=None, notification=None):
+    """Standard API response format with notification support"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                result = func(*args, **kwargs)
+                if isinstance(result, dict):
+                    response = {
+                        'success': result.get('success', success),
+                        'message': result.get('message', message),
+                        'data': result.get('data', data)
+                    }
+                    # Add notification data if provided
+                    if 'notification' in result:
+                        response['notification'] = result['notification']
+                        add_notification_to_history(result['notification'])
+                    elif notification:
+                        response['notification'] = notification
+                        add_notification_to_history(notification)
+                    return jsonify(response)
+                return result
+            except Exception as e:
+                logging.error(f"API Error in {func.__name__}: {e}")
+                error_notification = {
+                    'type': 'error',
+                    'title': 'Server Error',
+                    'message': 'An internal server error occurred',
+                    'timestamp': datetime.now().isoformat()
+                }
+                add_notification_to_history(error_notification)
+                return jsonify({
+                    'success': False,
+                    'message': f"Internal error: {str(e)}",
+                    'notification': error_notification
+                })
+        return wrapper
+    return decorator
+
+def add_notification_to_history(notification):
+    """Add notification to history for tracking"""
+    global notification_history
+    notification['timestamp'] = notification.get('timestamp', datetime.now().isoformat())
+    notification['id'] = f"notif_{len(notification_history)}_{datetime.now().timestamp()}"
+    notification_history.append(notification)
+    
+    # Limit history size
+    if len(notification_history) > MAX_NOTIFICATION_HISTORY:
+        notification_history = notification_history[-MAX_NOTIFICATION_HISTORY:]
+
+# ==================== HELPER FUNCTIONS ====================
+def safe_serial_close(serial_obj):
+    if serial_obj and hasattr(serial_obj, 'is_open'):
+        try:
+            serial_obj.close()
+        except:
+            pass
+
+def is_port_available(port_name):
+    try:
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if port_name not in ports: 
+            return False
+        try:
+            s = serial.Serial(port_name)
+            s.close()
+            return True
+        except:
+            return False
+    except:
+        return False
+
+def to_decimal(coord, direct):
+    if not coord or not direct: 
+        return None
+    try:
+        dot_index = coord.find('.')
+        if dot_index > 0:
+            deg = float(coord[:dot_index-2])
+            min = float(coord[dot_index-2:])
+        else:
+            cutoff = 2 if len(coord.split('.')[0]) <= 4 else 3 
+            deg = float(coord[:cutoff])
+            min = float(coord[cutoff:])
+        val = deg + (min / 60)
+        return -val if direct in ['S', 'W'] else val
+    except: 
+        return None
+
+def parse_nmea(sentence):
+    try:
+        if not sentence.startswith('$'): 
+            return None
+        parts = sentence.split('*')[0].split(',')
+        if len(parts) < 6: 
+            return None
+        msg_type = parts[0][-3:]
+        
+        if msg_type == 'GGA':
+            quality = int(parts[6]) if parts[6] else 0
+            if quality > 0:
+                return {
+                    'lat': to_decimal(parts[2], parts[3]),
+                    'lon': to_decimal(parts[4], parts[5]),
+                    'altitude': float(parts[9]) if parts[9] else 0.0,
+                    'satellites': int(parts[7]) if parts[7] else 0,
+                    'hdop': float(parts[8]) if parts[8] else 0.0, 
+                    'fix_quality': quality,
+                    'valid': True
+                }
+        elif msg_type == 'RMC':
+            if parts[2] == 'A': 
+                speed = float(parts[7]) if parts[7] else 0.0
+                return {
+                    'lat': to_decimal(parts[3], parts[4]),
+                    'lon': to_decimal(parts[5], parts[6]),
+                    'speed': speed * 1.852, 
+                    'valid': True
+                }
+    except: 
+        pass
+    return None
+
+def process_gps_data(line):
+    parsed = parse_nmea(line)
+    if parsed:
+        with map_data_lock:
+            map_session.update(parsed)
+            map_session['last_update'] = datetime.now().strftime('%H:%M:%S')
+            if 'lat' in parsed and 'lon' in parsed:
+                map_track_history.append({
+                    'time': map_session['last_update'],
+                    'lat': parsed['lat'],
+                    'lon': parsed['lon'],
+                    'alt': parsed.get('altitude', 0),
+                    'speed': parsed.get('speed', 0)
+                })
+
+def serial_reader():
+    global ser, monitor_running
+    while monitor_running:
+        try:
+            if ser and ser.is_open:
+                line = ser.readline().decode('utf-8', errors='replace')
+                if line:
+                    monitor_queue.put(line)
+                    if line.startswith('$'): 
+                        process_gps_data(line.strip())
+                else:
+                    time.sleep(0.01)
+            else:
+                if current_port and monitor_running:
+                    reconnect_serial()
+                else:
+                    time.sleep(0.1)
+        except:
+            time.sleep(1)
+
+def reconnect_serial():
+    global ser
+    time.sleep(2)
+    try:
+        if is_port_available(current_port):
+            ser = serial.Serial(port=current_port, baudrate=current_baud, timeout=0.1)
+    except: 
+        pass
+
+def cleanup_serial():
+    global ser, monitor_running
+    with monitor_lock:
+        monitor_running = False
+        safe_serial_close(ser)
+
+atexit.register(cleanup_on_shutdown)
+
+# ==================== STM32 LOADER CLASS ====================
+class STM32LoaderWeb:
+    def get_serial_ports(self):
+        return [port.device for port in serial.tools.list_ports.comports()]
+
+    def upload_firmware(self, port, file_path, file_type, baud_rate):
+        try:
+            env = os.environ.copy()
+            env['STM32LOADER_SERIAL_PORT'] = port
+            args = ["-p", port, "-e", "-w", "-v", "-b", str(baud_rate)]
+            if file_type == "bin":
+                args.append("-B")
+            args.append(file_path)
+            
+            # UPDATED: Use the custom flag to call ourself
+            if getattr(sys, 'frozen', False):
+                # Call the EXE itself with the flag
+                cmd = [sys.executable, '--firmware-upload'] + args
+            else:
+                # Dev mode
+                cmd = [sys.executable, "-m", "stm32loader"] + args
+            
+            logging.info(f"Running upload command: {cmd}")
+            
+            proc = subprocess.run(
+                cmd,
+                env=env, 
+                capture_output=True, 
+                text=True, 
+                timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            
+            return {
+                'success': proc.returncode == 0,
+                'message': proc.stdout + "\n" + proc.stderr,
+                'returncode': proc.returncode
+            }
+        except subprocess.TimeoutExpired:
+            return {'success': False, 'message': 'Upload timeout (60 seconds)', 'returncode': -1}
+        except Exception as e:
+            return {'success': False, 'message': str(e), 'returncode': -1}
+
+stm32_loader = STM32LoaderWeb()
+
+# ==================== APPLICATION INITIALIZATION ====================
+def initialize_application():
+    """Initialize application components"""
+    global app_start_time
+    app_start_time = time.time()
+    logging.info("Application initialized")
+    
+    # Add startup notification
+    startup_notification = {
+        'type': 'info',
+        'title': 'System Started',
+        'message': 'Drone Control Center initialized successfully',
+        'timestamp': datetime.now().isoformat(),
+        'duration': 3000
+    }
+    add_notification_to_history(startup_notification)
+
+# ==================== FLASK ROUTES ====================
+@app.route('/')
+def index(): 
+    # Initialize on first request if needed
+    if 'initialized' not in globals():
+        initialize_application()
+        globals()['initialized'] = True
+    return render_template('index.html')
+
+@app.route('/program-uploader-content')
+def program_uploader_content(): 
+    return render_template('program_uploader.html')
+
+@app.route('/dashboard-content')
+def dashboard_content(): 
+    return render_template('dashboard.html')
+
+@app.route('/3d-sim-content')
+def sim_content(): 
+    return render_template('3d_sim.html')
+
+@app.route('/map-content')
+def map_content(): 
+    return render_template('map.html', 
+                          DEFAULT_LAT=DEFAULT_LAT, 
+                          DEFAULT_LON=DEFAULT_LON, 
+                          DEFAULT_ZOOM=DEFAULT_ZOOM)
+
+@app.route('/models/<path:filename>')
+def serve_model(filename): 
+    return send_from_directory(MODELS_DIR, filename)
+
+@app.route('/api/map/data')
+def get_map_data():
+    with map_data_lock: 
+        return jsonify(map_session)
+
+@app.route('/api/ports')
+def get_ports(): 
+    return jsonify(stm32_loader.get_serial_ports())
+
+@app.route('/api/upload', methods=['POST'])
+@api_response(success=False, message="Upload failed")
+def handle_upload():
+    file = request.files.get('file')
+    if not file:
+        return {
+            'success': False,
+            'message': 'No file provided',
+            'notification': {
+                'type': 'error',
+                'title': 'No File',
+                'message': 'Please select a firmware file',
+                'duration': 4000
+            }
+        }
+    
+    # Validate file
+    filename = secure_filename(file.filename)
+    if not filename.lower().endswith(('.bin', '.hex')):
+        return {
+            'success': False,
+            'message': 'Invalid file type. Please upload .bin or .hex files',
+            'notification': {
+                'type': 'error',
+                'title': 'Invalid File',
+                'message': 'Only .bin and .hex files are supported',
+                'duration': 4000
+            }
+        }
+    
+    save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    
+    try:
+        file.save(save_path)
+    except Exception as e:
+        return {
+            'success': False,
+            'message': f'Failed to save file: {str(e)}',
+            'notification': {
+                'type': 'error',
+                'title': 'Save Failed',
+                'message': 'Could not save uploaded file',
+                'duration': 4000
+            }
+        }
+    
+    port = request.form.get('port')
+    ftype = request.form.get('file_type', 'bin')
+    baud = request.form.get('baud_rate', DEFAULT_BAUD_RATE)
+    
+    if not port:
+        try:
+            os.remove(save_path)
+        except:
+            pass
+        return {
+            'success': False,
+            'message': 'No COM port selected',
+            'notification': {
+                'type': 'error',
+                'title': 'No Port',
+                'message': 'Please select a COM port',
+                'duration': 4000
+            }
+        }
+    
+    # Show progress notification
+    res = stm32_loader.upload_firmware(port, save_path, ftype, baud)
+    
+    # Clean up uploaded file immediately after upload
+    try:
+        os.remove(save_path)
+    except:
+        pass
+    
+    # Add notification to response
+    if res['success']:
+        res['notification'] = {
+            'type': 'success',
+            'title': 'Upload Successful',
+            'message': 'Firmware uploaded successfully',
+            'duration': 5000
+        }
+    else:
+        res['notification'] = {
+            'type': 'error',
+            'title': 'Upload Failed',
+            'message': 'Firmware upload failed. Check connection and try again.',
+            'details': res['message'],
+            'duration': 6000
+        }
+    
+    return res
+
+@app.route('/api/serial/connect', methods=['POST'])
+@api_response(success=False, message="Connection failed")
+def connect_serial():
+    global ser, monitor_thread, monitor_running, current_port, current_baud
+    data = request.json
+    port = data.get('port')
+    baud = int(data.get('baud_rate', DEFAULT_BAUD_RATE))
+    
+    with monitor_lock:
+        current_port = port
+        current_baud = baud
+        monitor_running = False
+        safe_serial_close(ser)
+        if monitor_thread: 
+            monitor_thread.join(1.0)
+        
+        try:
+            # Check if port is available
+            if not is_port_available(port):
+                return {
+                    'success': False,
+                    'message': f'Port {port} is not available',
+                    'notification': {
+                        'type': 'error',
+                        'title': 'Port Unavailable',
+                        'message': f'Port {port} is not available or in use',
+                        'duration': 5000
+                    }
+                }
+            
+            ser = serial.Serial(port, baud, timeout=0.1)
+            monitor_running = True
+            monitor_thread = threading.Thread(target=serial_reader, daemon=True)
+            monitor_thread.start()
+            
+            # Enhanced response with notification
+            return {
+                'success': True,
+                'message': f'Connected to {port} at {baud} baud',
+                'notification': {
+                    'type': 'success',
+                    'title': 'Connected',
+                    'message': f'Serial connection established on {port}',
+                    'duration': 3000
+                }
+            }
+        except serial.SerialException as e:
+            return {
+                'success': False,
+                'message': str(e),
+                'notification': {
+                    'type': 'error',
+                    'title': 'Connection Failed',
+                    'message': f'Failed to connect to {port}: {str(e)}',
+                    'duration': 5000
+                }
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': str(e),
+                'notification': {
+                    'type': 'error',
+                    'title': 'Connection Error',
+                    'message': f'Unexpected error connecting to {port}',
+                    'duration': 5000
+                }
+            }
+
+@app.route('/api/serial/disconnect', methods=['POST'])
+@api_response(success=False, message="Disconnect failed")
+def disconnect_serial():
+    global ser, monitor_running
+    try:
+        cleanup_serial()
+        return {
+            'success': True,
+            'message': 'Disconnected successfully',
+            'notification': {
+                'type': 'info',
+                'title': 'Disconnected',
+                'message': 'Serial connection closed',
+                'duration': 3000
+            }
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'message': str(e),
+            'notification': {
+                'type': 'error',
+                'title': 'Disconnect Error',
+                'message': 'Failed to disconnect properly',
+                'duration': 4000
+            }
+        }
+
+@app.route('/api/serial/data')
+def get_data():
+    out = []
+    while not monitor_queue.empty():
+        try: 
+            out.append(monitor_queue.get_nowait())
+        except: 
+            break
+    return jsonify({'data': ''.join(out)})
+
+@app.route('/api/serial/send', methods=['POST'])
+@api_response(success=False, message="Send failed")
+def send_data():
+    data = request.json
+    msg = data.get('message', '').strip()
+    line_ending = data.get('line_ending', 'lf')
+    
+    if not msg:
+        return {
+            'success': False,
+            'message': 'No message provided',
+            'notification': {
+                'type': 'warning',
+                'title': 'Empty Command',
+                'message': 'Please enter a command to send',
+                'duration': 3000
+            }
+        }
+    
+    try:
+        if not ser or not ser.is_open:
+            return {
+                'success': False,
+                'message': 'Serial port not connected',
+                'notification': {
+                    'type': 'error',
+                    'title': 'Not Connected',
+                    'message': 'Connect to a serial port first',
+                    'duration': 4000
+                }
+            }
+        
+        # Add line ending
+        if line_ending == 'lf':
+            msg_to_send = msg + '\n'
+        elif line_ending == 'cr':
+            msg_to_send = msg + '\r'
+        elif line_ending == 'crlf':
+            msg_to_send = msg + '\r\n'
+        else:
+            msg_to_send = msg + '\n'
+        
+        ser.write(msg_to_send.encode())
+        
+        # Log the command
+        logging.info(f"Sent command: {msg}")
+        
+        # Check for special commands that need feedback
+        command_map = {
+            'e': 'IMU Streaming',
+            'i': 'GPS Activation', 
+            'q': 'Stop Command',
+            'm1': 'Motor 1 Test',
+            'm2': 'Motor 2 Test',
+            'm3': 'Motor 3 Test',
+            'm4': 'Motor 4 Test',
+            't': 'Tare IMU'
+        }
+        
+        cmd_name = command_map.get(msg, msg)
+        
+        return {
+            'success': True,
+            'message': f'Command sent: {msg}',
+            'notification': {
+                'type': 'success',
+                'title': 'Command Sent',
+                'message': f'{cmd_name} command executed',
+                'duration': 2000
+            }
+        }
+    except Exception as e:
+        logging.error(f"Send error: {e}")
+        return {
+            'success': False,
+            'message': str(e),
+            'notification': {
+                'type': 'error',
+                'title': 'Send Failed',
+                'message': f'Failed to send: {msg}',
+                'duration': 4000
+            }
+        }
+
+@app.route('/api/notifications', methods=['GET'])
+def get_notifications():
+    """Get system notifications"""
+    with app.app_context():
+        notifications = [
+            {
+                'type': 'info',
+                'title': 'System Status',
+                'message': f'Application running on port 5003',
+                'timestamp': datetime.now().isoformat(),
+                'duration': 3000
+            }
+        ]
+        
+        # Add serial connection status
+        if ser and ser.is_open:
+            notifications.append({
+                'type': 'success',
+                'title': 'Serial Status',
+                'message': f'Connected to {current_port} at {current_baud} baud',
+                'timestamp': datetime.now().isoformat()
+            })
+        else:
+            notifications.append({
+                'type': 'warning',
+                'title': 'Serial Status',
+                'message': 'Not connected to any serial port',
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        # Add GPS status
+        with map_data_lock:
+            if map_session['valid']:
+                notifications.append({
+                    'type': 'success',
+                    'title': 'GPS Status',
+                    'message': f'GPS lock with {map_session["satellites"]} satellites',
+                    'timestamp': datetime.now().isoformat()
+                })
+        
+        return jsonify({
+            'success': True,
+            'notifications': notifications,
+            'history': notification_history[-10:],  # Last 10 notifications
+            'unread_count': len([n for n in notification_history if not n.get('read', False)])
+        })
+
+@app.route('/api/notifications/clear', methods=['POST'])
+def clear_notifications():
+    """Clear notification history"""
+    global notification_history
+    notification_history = []
+    return jsonify({
+        'success': True,
+        'message': 'Notification history cleared',
+        'notification': {
+            'type': 'info',
+            'title': 'Notifications Cleared',
+            'message': 'Notification history has been cleared',
+            'duration': 3000
+        }
+    })
+
+@app.route('/api/notifications/mark-read', methods=['POST'])
+def mark_notifications_read():
+    """Mark all notifications as read"""
+    global notification_history
+    for notification in notification_history:
+        notification['read'] = True
+    return jsonify({
+        'success': True,
+        'message': 'All notifications marked as read'
+    })
+
+@app.route('/api/system/status', methods=['GET'])
+def system_status():
+    """Get system status information"""
+    status = {
+        'connected': ser and ser.is_open,
+        'port': current_port if ser and ser.is_open else None,
+        'baudrate': current_baud if ser and ser.is_open else None,
+        'monitor_running': monitor_running,
+        'gps_valid': map_session['valid'],
+        'gps_satellites': map_session['satellites'],
+        'uptime': time.time() - app_start_time,
+        'notification_count': len(notification_history)
+    }
+    return jsonify({
+        'success': True,
+        'data': status,
+        'notification': {
+            'type': 'info',
+            'title': 'System Status',
+            'message': 'System status retrieved',
+            'duration': 2000
+        } if ser and ser.is_open else None
+    })
+
+@app.route('/api/system/cleanup', methods=['POST'])
+def system_cleanup():
+    """Clean up temporary files"""
+    try:
+        # Remove uploads folder if empty
+        if os.path.exists(UPLOAD_FOLDER):
+            if not os.listdir(UPLOAD_FOLDER):
+                shutil.rmtree(UPLOAD_FOLDER)
+                os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+                message = "Uploads folder cleaned (was empty)"
+            else:
+                message = "Uploads folder not empty - skipping cleanup"
+        else:
+            message = "Uploads folder does not exist"
+        
+        return jsonify({
+            'success': True,
+            'message': message,
+            'notification': {
+                'type': 'info',
+                'title': 'Cleanup Complete',
+                'message': message,
+                'duration': 3000
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': str(e),
+            'notification': {
+                'type': 'error',
+                'title': 'Cleanup Failed',
+                'message': 'Failed to clean up files',
+                'duration': 4000
+            }
+        })
+
+@app.route('/api/system/info', methods=['GET'])
+def system_info():
+    """Get system information"""
+    info = {
+        'python_version': sys.version,
+        'platform': sys.platform,
+        'app_directory': BASE_DIR,
+        'upload_folder': UPLOAD_FOLDER if os.path.exists(UPLOAD_FOLDER) else 'Not created',
+        'models_folder': MODELS_DIR,
+        'max_file_size': MAX_FILE_SIZE,
+        'default_baud_rate': DEFAULT_BAUD_RATE,
+        'flask_debug': app.debug
+    }
+    return jsonify({
+        'success': True,
+        'data': info,
+        'notification': {
+            'type': 'info',
+            'title': 'System Info',
+            'message': 'System information retrieved',
+            'duration': 2000
+        }
+    })
+
+# ==================== ERROR HANDLERS ====================
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({
+        'success': False,
+        'message': 'Resource not found',
+        'notification': {
+            'type': 'error',
+            'title': '404 Not Found',
+            'message': 'The requested resource was not found',
+            'duration': 4000
+        }
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    logging.error(f"Internal server error: {error}")
+    return jsonify({
+        'success': False,
+        'message': 'Internal server error',
+        'notification': {
+            'type': 'error',
+            'title': 'Server Error',
+            'message': 'An internal server error occurred. Check logs for details.',
+            'duration': 5000
+        }
+    }), 500
+
+@app.errorhandler(400)
+def bad_request_error(error):
+    return jsonify({
+        'success': False,
+        'message': 'Bad request',
+        'notification': {
+            'type': 'error',
+            'title': 'Bad Request',
+            'message': 'The request was malformed or missing required parameters',
+            'duration': 4000
+        }
+    }), 400
+
+@app.errorhandler(413)
+def request_too_large_error(error):
+    return jsonify({
+        'success': False,
+        'message': 'File too large',
+        'notification': {
+            'type': 'error',
+            'title': 'File Too Large',
+            'message': 'The uploaded file exceeds the maximum allowed size (16MB)',
+            'duration': 5000
+        }
+    }), 413
+
+# ==================== APPLICATION TEARDOWN ====================
+@app.teardown_appcontext
+def teardown_appcontext(exception=None):
+    """Clean up on app context teardown"""
+    if exception:
+        logging.error(f"App context teardown with exception: {exception}")
+
+# ==================== MAIN ENTRY POINT ====================
+if __name__ == '__main__':
+    # Log startup
+    logging.info("Application starting...")
+    
+    try:
+        # Initialize application
+        initialize_application()
+        
+        def start_server(): 
+            app.run(debug=False, host='127.0.0.1', port=5003, use_reloader=False)
+        
+        t = threading.Thread(target=start_server, daemon=True)
+        t.start()
+        time.sleep(1)  # Wait for Flask
+        
+        # Create Window
+        window = webview.create_window(
+            'Drone Control Center', 
+            'http://127.0.0.1:5003', 
+            width=1280, 
+            height=800,
+            resizable=True,
+            min_size=(800, 600)
+        )
+        
+        # Set window icon if available
+        try:
+            icon_path = os.path.join(RESOURCE_DIR, 'icon.ico')
+            if os.path.exists(icon_path):
+                window.set_icon(icon_path)
+        except:
+            pass
+        
+        webview.start()
+        
+    except Exception as e:
+        logging.critical(f"Critical Error: {e}")
+        logging.critical(traceback.format_exc())
+        
+        # Show error message if possible
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Critical Error", 
+                f"The application encountered a critical error:\n\n{str(e)}\n\nCheck debug.log for details.")
+            root.destroy()
+        except:
+            print(f"CRITICAL ERROR: {e}")
+        
+        time.sleep(5)
+    finally:
+        # Cleanup on exit
+        cleanup_on_shutdown()
+        logging.info("Application shutdown complete")
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drone Control Center</title>
+    <style>
+        /* All common styles for the application are kept here */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+            transition: margin-left 0.3s;
+        }
+        
+        .header {
+            background-color: #173681;
+            color: white;
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 2001;
+            height: 70px;
+        }
+        
+        .hamburger-btn {
+            background: none; border: none; color: white;
+            font-size: 1.5rem; cursor: pointer; padding: 0.5rem;
+            margin-right: 1rem; border-radius: 4px;
+            transition: background-color 0.3s;
+        }
+        .hamburger-btn:hover { background-color: rgba(255,255,255,0.1); }
+        .header h1 { font-size: 1.5rem; font-weight: normal; }
+        
+        .sidebar {
+            height: 100vh; width: 0; position: fixed;
+            top: 70px; left: 0; background-color: #2c3e50;
+            overflow-x: hidden; transition: width 0.3s; z-index: 2000;
+        }
+        .sidebar.open { width: 250px; }
+        
+        .nav-links { list-style: none; padding: 1rem 0; }
+        .nav-links li { border-bottom: 1px solid #34495e; }
+        .nav-links a {
+            display: block; padding: 1rem 2rem;
+            color: #ecf0f1; text-decoration: none;
+            transition: background-color 0.3s;
+        }
+        .nav-links a:hover { background-color: #34495e; }
+        .nav-links a.active { background-color: #173681; color: white; }
+        
+        .main-content { margin-top: 70px; padding: 3px; min-height: calc(100vh - 70px); }
+
+        .container {
+            max-width: none; width: 100%; margin: 0; padding: 20px;
+            border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .section { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #eee; }
+        .form-group { margin-bottom: 15px; }
+        label { display: inline-block; width: 120px; font-weight: bold; }
+        
+        select, input[type="text"], input[type="number"], button, input[type="file"] {
+            padding: 8px 12px; margin: 5px; border: 1px solid #ddd; border-radius: 4px;
+        }
+        
+        button { background-color: #173681; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #005a87; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        
+        .log-container {
+            border: 1px solid #ddd; border-radius: 4px; padding: 10px;
+            background-color: #f9f9f9; font-family: monospace;
+            height: 300px; overflow-y: auto; white-space: pre-wrap;
+        }
+        
+        .status { padding: 10px; border-radius: 4px; margin: 10px 0; display: inline-block; }
+        .status.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .status.error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .status.info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        
+        .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        
+        .data-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; margin: 15px 0; }
+        .data-panel { border: 1px solid #ddd; border-radius: 8px; padding: 15px; background-color: #f8f9fa; }
+        .data-panel h4 { margin: 0 0 10px 0; color: #173681; border-bottom: 1px solid #dee2e6; padding-bottom: 5px; }
+        .data-content { display: flex; flex-direction: column; gap: 8px; }
+        .data-row { display: flex; justify-content: space-between; align-items: center; }
+        .data-label { font-weight: bold; color: #495057; }
+        .data-value {
+            font-family: monospace; background-color: white; padding: 2px 8px;
+            border-radius: 3px; border: 1px solid #ced4da; min-width: 80px; text-align: center;
+        }
+        
+        /* Dashboard-specific styles */
+        .dashboard-grid-layout { display: grid; grid-template-columns: 200px 1fr 200px; gap: 15px; }
+        .command-sidebar, .motor-sidebar > div { display: flex; flex-direction: column; gap: 10px; }
+        .cmd-btn, .motor-btn, .stop-btn { width: 100%; text-align: center; padding: 10px; margin: 0; }
+        .dashboard-center-stack > .section { margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid #eee; }
+        .dashboard-center-stack > .section:last-child { border-bottom: none; }
+
+        .cmd-btn {
+            background-color: #28a745; color: white; border: none; padding: 12px 15px;
+            border-radius: 5px; cursor: pointer; font-size: 14px; text-align: left;
+            transition: background-color 0.3s;
+        }
+        .cmd-btn:hover { background-color: #218838; }
+        .motor-btn.danger { background-color: #dc3545; color: white; }
+        .motor-btn.danger:hover { background-color: #c82333; }
+        .stop-btn {
+            background-color: #ffc107; color: #212529; border: none; padding: 12px 20px;
+            border-radius: 5px; cursor: pointer; font-size: 16px; font-weight: bold;
+        }
+        .stop-btn:hover { background-color: #e0a800; }
+        .danger-zone { border: 2px solid #dc3545; border-radius: 8px; padding: 15px; background-color: #fff5f5; }
+        .active-command { box-shadow: 0 0 0 3px #007bff; }
+        .armed { color: #dc3545; font-weight: bold; }
+        .disarmed { color: #28a745; font-weight: bold; }
+        
+        /* PID section */
+        .pid-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; }
+        .pid-card { border: 1px solid #ddd; border-radius: 8px; padding: 15px; background-color: #f8f9fa; }
+        .pid-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .pid-row label { flex: 1; max-width: 150px; font-weight: normal; }
+        .pid-row input[type="number"] { flex: 1; min-width: 80px; }
+        .pid-row input[type="checkbox"] { margin-left: 10px; width: 20px; height: 20px; }
+
+        /* 3D Simulator Styles */
+        .simulator-layout { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin: 20px 0; }
+        .model-section { border: 1px solid #ddd; border-radius: 8px; padding: 15px; background: #f8f9fa; }
+        #model-container {
+            width: 100%; height: 400px; background: #1a1a1a;
+            border-radius: 4px; margin: 10px 0; position: relative; overflow: hidden;
+        }
+        .sim-controls { display: flex; gap: 10px; margin-top: 10px; }
+        .sim-controls button { background-color: #6c757d; padding: 8px 15px; font-size: 14px; }
+        .sim-controls button:hover { background-color: #5a6268; }
+        .sensor-section { border: 1px solid #ddd; border-radius: 8px; padding: 15px; background: #f8f9fa; }
+        .sensor-grid { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
+        .sensor-card {
+            background: white; padding: 12px; border-radius: 6px; border: 1px solid #dee2e6;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .sensor-label { font-weight: bold; color: #495057; font-size: 14px; }
+        .sensor-value {
+            font-family: 'Courier New', monospace; font-size: 16px; font-weight: bold;
+            color: #173681; background: #f8f9fa; padding: 4px 8px;
+            border-radius: 4px; min-width: 80px; text-align: center;
+        }
+        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 15px; }
+        .info-card { background: #f8f9fa; padding: 15px; border-radius: 8px; border: 1px solid #dee2e6; }
+        .info-card h4 { margin: 0 0 10px 0; color: #173681; font-size: 16px; }
+        .info-card ul { margin: 0; padding-left: 20px; }
+        .info-card li { margin-bottom: 5px; font-size: 14px; color: #495057; }
+        
+        /* ==================== CUSTOM NOTIFICATION SYSTEM ==================== */
+
+/* Toast Notification Container */
+.toast-container {
+    position: fixed;
+    top: 90px; /* Below header */
+    right: 20px;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 350px;
+}
+
+/* Toast Notification */
+.toast {
+    background: white;
+    border-radius: 8px;
+    padding: 15px 20px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 300px;
+    max-width: 350px;
+    transform: translateX(400px);
+    animation: slideInRight 0.5s forwards, fadeOut 0.5s 4.5s forwards;
+    border-left: 4px solid #173681;
+    opacity: 1;
+    transition: all 0.3s ease;
+}
+
+.toast:hover {
+    transform: translateX(0) scale(1.02);
+    opacity: 1;
+    animation: none;
+}
+
+@keyframes slideInRight {
+    to {
+        transform: translateX(0);
+    }
+}
+
+@keyframes fadeOut {
+    to {
+        opacity: 0;
+        transform: translateX(400px) scale(0.9);
+    }
+}
+
+/* Toast Types */
+.toast-success {
+    border-left-color: #28a745;
+    background: linear-gradient(135deg, #d4edda 0%, #ffffff 100%);
+}
+
+.toast-warning {
+    border-left-color: #ffc107;
+    background: linear-gradient(135deg, #fff3cd 0%, #ffffff 100%);
+}
+
+.toast-error {
+    border-left-color: #dc3545;
+    background: linear-gradient(135deg, #f8d7da 0%, #ffffff 100%);
+}
+
+.toast-info {
+    border-left-color: #17a2b8;
+    background: linear-gradient(135deg, #d1ecf1 0%, #ffffff 100%);
+}
+
+/* Toast Icon */
+.toast-icon {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+.toast-success .toast-icon {
+    background: #28a745;
+    color: white;
+}
+
+.toast-warning .toast-icon {
+    background: #ffc107;
+    color: #212529;
+}
+
+.toast-error .toast-icon {
+    background: #dc3545;
+    color: white;
+}
+
+.toast-info .toast-icon {
+    background: #17a2b8;
+    color: white;
+}
+
+/* Toast Content */
+.toast-content {
+    flex: 1;
+}
+
+.toast-title {
+    font-weight: bold;
+    color: #2c3e50;
+    margin-bottom: 3px;
+    font-size: 14px;
+}
+
+.toast-message {
+    font-size: 13px;
+    color: #7f8c8d;
+    line-height: 1.4;
+}
+
+/* Toast Close Button */
+.toast-close {
+    background: none;
+    border: none;
+    color: #95a5a6;
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: all 0.3s;
+}
+
+.toast-close:hover {
+    background: #f5f5f5;
+    color: #e74c3c;
+}
+
+/* Toast Progress Bar */
+.toast-progress {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: currentColor;
+    opacity: 0.3;
+    animation: progressBar 5s linear forwards;
+}
+
+@keyframes progressBar {
+    from { width: 100%; }
+    to { width: 0%; }
+}
+
+/* Alert Modal Overlay */
+.alert-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 10000;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* Alert Modal */
+.alert-modal {
+    background: white;
+    border-radius: 12px;
+    width: 90%;
+    max-width: 400px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+    overflow: hidden;
+    animation: slideInUp 0.3s ease;
+    transform: translateY(20px);
+}
+
+@keyframes slideInUp {
+    from {
+        opacity: 0;
+        transform: translateY(-20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Alert Header */
+.alert-header {
+    padding: 20px 25px 10px;
+    text-align: center;
+    border-bottom: 1px solid #eee;
+    background: #173681;
+    color: white;
+}
+
+.alert-header.error { background: #dc3545; }
+.alert-header.warning { background: #ffc107; color: #212529; }
+.alert-header.success { background: #28a745; }
+.alert-header.info { background: #17a2b8; }
+
+.alert-icon {
+    width: 60px;
+    height: 60px;
+    margin: 0 auto 15px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.alert-title {
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 5px;
+}
+
+.alert-subtitle {
+    font-size: 14px;
+    opacity: 0.9;
+}
+
+/* Alert Body */
+.alert-body {
+    padding: 20px 25px;
+    text-align: center;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.alert-message {
+    color: #2c3e50;
+    font-size: 16px;
+    line-height: 1.5;
+    margin-bottom: 10px;
+}
+
+.alert-details {
+    font-size: 12px;
+    color: #7f8c8d;
+    background: #f8f9fa;
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin: 10px 0;
+    text-align: left;
+    white-space: pre-wrap;
+    font-family: monospace;
+    max-height: 150px;
+    overflow-y: auto;
+    display: none;
+}
+
+/* Alert Footer */
+.alert-footer {
+    padding: 15px 25px 25px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    border-top: 1px solid #eee;
+    background: #f8f9fa;
+}
+
+.alert-btn {
+    padding: 10px 25px;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s;
+    min-width: 100px;
+    font-size: 14px;
+}
+
+.alert-btn-primary {
+    background: #173681;
+    color: white;
+}
+
+.alert-btn-primary:hover {
+    background: #0d2554;
+    transform: translateY(-2px);
+}
+
+.alert-btn-secondary {
+    background: #6c757d;
+    color: white;
+}
+
+.alert-btn-secondary:hover {
+    background: #5a6268;
+}
+
+.alert-btn-danger {
+    background: #dc3545;
+    color: white;
+}
+
+.alert-btn-danger:hover {
+    background: #c82333;
+}
+
+/* Alert Close Button */
+.alert-close-btn {
+    position: absolute;
+    top: 15px;
+    right: 15px;
+    background: none;
+    border: none;
+    font-size: 24px;
+    color: white;
+    cursor: pointer;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.3s;
+    z-index: 1;
+}
+
+.alert-close-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+/* Notification Badge */
+.notification-badge {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    background: #dc3545;
+    color: white;
+    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.1); }
+    100% { transform: scale(1); }
+}
+
+/* Connection Status Toast (Special) */
+.toast-connection {
+    border-left-color: #173681;
+    background: linear-gradient(135deg, #e3f2fd 0%, #ffffff 100%);
+}
+
+.toast-connection .toast-icon {
+    background: #173681;
+    animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* Emergency Toast Styling */
+.emergency-toast {
+    border-left: 4px solid #ff0000 !important;
+    background: linear-gradient(135deg, #ffcccc 0%, #ffffff 100%) !important;
+    animation: pulseEmergency 0.5s infinite !important;
+    box-shadow: 0 0 15px rgba(255, 0, 0, 0.5) !important;
+    cursor: pointer;
+}
+
+.emergency-toast .toast-icon {
+    background: #ff0000 !important;
+    animation: spin 1s linear infinite !important;
+}
+
+@keyframes pulseEmergency {
+    0% { box-shadow: 0 0 10px rgba(255, 0, 0, 0.5); }
+    50% { box-shadow: 0 0 20px rgba(255, 0, 0, 0.8); }
+    100% { box-shadow: 0 0 10px rgba(255, 0, 0, 0.5); }
+}
+
+/* Motor Control Specific */
+.motor-active {
+    background-color: #dc3545 !important;
+    color: white !important;
+    animation: motorPulse 2s infinite;
+}
+
+@keyframes motorPulse {
+    0% { box-shadow: 0 0 0 0 rgba(220, 53, 69, 0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(220, 53, 69, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(220, 53, 69, 0); }
+}
+
+/* Danger Zone Styling */
+.danger-zone-active {
+    border-color: #ff0000 !important;
+    background: linear-gradient(135deg, #ffe6e6 0%, #fff5f5 100%) !important;
+    animation: dangerZonePulse 3s infinite;
+}
+
+@keyframes dangerZonePulse {
+    0% { border-color: #ff0000; }
+    50% { border-color: #ff6666; }
+    100% { border-color: #ff0000; }
+}
+
+/* Dark Mode Support */
+@media (prefers-color-scheme: dark) {
+    .toast {
+        background: #2c3e50;
+        color: #ecf0f1;
+    }
+    
+    .toast-title {
+        color: #ecf0f1;
+    }
+    
+    .toast-message {
+        color: #bdc3c7;
+    }
+    
+    .alert-modal {
+        background: #2c3e50;
+        color: #ecf0f1;
+    }
+    
+    .alert-message {
+        color: #ecf0f1;
+    }
+}
+
+
+        @media (max-width: 968px) {
+            .dashboard-grid-layout { grid-template-columns: 1fr; }
+            .command-sidebar, .motor-sidebar > div { flex-direction: row; flex-wrap: wrap; }
+            .cmd-btn, .motor-btn { width: 48%; }
+            .stop-btn { width: 100%; }
+            .simulator-layout { grid-template-columns: 1fr; }
+            #model-container { height: 300px; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <button class="hamburger-btn" id="hamburgerBtn">☰</button>
+        <h1>Scientech</h1>
+    </header>
+    
+    <nav class="sidebar" id="sidebar">
+        <ul class="nav-links">
+            <li><a href="#program-uploader" class="nav-link active" data-url="/program-uploader-content">Program Uploader</a></li>
+            <li><a href="#dashboard" class="nav-link" data-url="/dashboard-content">Dashboard</a></li>
+            <li><a href="#3d-sim" class="nav-link" data-url="/3d-sim-content">3D Simulator</a></li>
+            <li><a href="#maps" class="nav-link" data-url="/map-content">GPS Maps</a></li>
+        </ul>
+    </nav>
+    
+    <!-- ==================== NOTIFICATION SYSTEM CONTAINERS ==================== -->
+
+<!-- Toast Notifications Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- Alert Modal -->
+<div class="alert-overlay" id="alertOverlay">
+    <div class="alert-modal" id="alertModal">
+        <button class="alert-close-btn" onclick="hideAlert()">×</button>
+        <div class="alert-header" id="alertHeader">
+            <div class="alert-icon" id="alertIcon">
+                <span id="alertIconSymbol">!</span>
+            </div>
+            <div class="alert-title" id="alertTitle">Alert Title</div>
+            <div class="alert-subtitle" id="alertSubtitle">Subtitle</div>
+        </div>
+        <div class="alert-body">
+            <div class="alert-message" id="alertMessage">This is the alert message content.</div>
+            <div class="alert-details" id="alertDetails"></div>
+        </div>
+        <div class="alert-footer">
+            <button class="alert-btn alert-btn-primary" id="alertPrimaryBtn" onclick="hideAlert()">OK</button>
+            <button class="alert-btn alert-btn-secondary" id="alertSecondaryBtn" onclick="hideAlert()" style="display: none;">Cancel</button>
+            <button class="alert-btn alert-btn-danger" id="alertDangerBtn" onclick="hideAlert()" style="display: none;">Delete</button>
+        </div>
+    </div>
+</div>
+
+    <div class="overlay" id="overlay"></div>
+    
+    <main class="main-content" id="dynamic-content">
+        <div class="container">
+            <h1 style="color: #173681;">Welcome to the Scientech Drone Control Center</h1>
+            <p>Please select a module from the sidebar to begin.</p>
+        </div>
+    </main>
+
+<script>
+// ==================== GLOBAL VARIABLES & CONFIG ====================
+let isConnected = false;
+let serialDataPoll = null;
+let dataCallbacks = [];
+
+// Map Support Globals
+let mapUpdatePoll = null;
+let mapInstance = null;
+let mapMarker = null;
+let mapPolyline = null;
+
+// Store current port and baud rate for global access
+let currentPort = null;
+let currentBaud = '57600';
+
+// Motor control state
+let activeMotorCommand = null;
+let activeMotorToast = null;
+
+// Map for dynamic page loading
+const pageMap = {
+    '#program-uploader': {
+        url: '/program-uploader-content',
+        init: 'initializeProgramUploader'
+    },
+    '#dashboard': {
+        url: '/dashboard-content',
+        init: 'initializeDashboard'
+    },
+    '#3d-sim': {
+        url: '/3d-sim-content',
+        init: 'initializeSimulator'
+    },
+    '#maps': {
+        url: '/map-content',
+        init: 'initializeMap'
+    }
+};
+
+// Sensor values for 3D simulation
+const sensorValues = { yaw: 0, pitch: 0, roll: 0, temp: 0, gyroX: 0, gyroY: 0, gyroZ: 0, accelX: 0, accelY: 0, accelZ: 0 };
+
+// Three.js variables
+let scene, camera, renderer, droneModel, controls, axesHelper;
+let isAxesVisible = true;
+
+// Betaflight-style rotation handling
+let targetRotation = { yaw: 0, pitch: 0, roll: 0 };
+let currentRotation = { yaw: 0, pitch: 0, roll: 0 };
+let useQuaternions = true;
+let rotationSmoothingFactor = 0.1;
+
+// ==================== SHARED UTILITY FUNCTIONS ====================
+
+function showStatus(element, message, type) {
+    if (element) {
+        element.textContent = message;
+        element.className = `status ${type}`;
+    }
+}
+
+function addDataCallback(callback) {
+    if (!dataCallbacks.includes(callback)) {
+        dataCallbacks.push(callback);
+    }
+}
+
+
+// ==================== NOTIFICATION SYSTEM ====================
+
+let notificationHistory = [];
+let maxNotifications = 50;
+
+// Show toast notification with emergency support
+function showToast(type, title, message, duration = 5000, emergency = false) {
+    const container = document.getElementById('toastContainer');
+    if (!container) {
+        console.error('Toast container not found');
+        return;
+    }
+    
+    const toastId = 'toast-' + Date.now();
+    const iconMap = {
+        'success': '✓',
+        'warning': '⚠',
+        'error': '✗',
+        'info': 'ℹ',
+        'connection': '↻'
+    };
+    
+    const toast = document.createElement('div');
+    toast.id = toastId;
+    
+    // Add emergency class for special styling
+    if (emergency) {
+        toast.className = `toast toast-error emergency-toast`;
+    } else {
+        toast.className = `toast toast-${type}`;
+    }
+    
+    toast.innerHTML = `
+        <div class="toast-icon">${iconMap[type] || 'ℹ'}</div>
+        <div class="toast-content">
+            <div class="toast-title">${title}</div>
+            <div class="toast-message">${message}</div>
+        </div>
+        <button class="toast-close" onclick="removeToast('${toastId}')">×</button>
+        ${duration > 0 ? '<div class="toast-progress"></div>' : ''}
+    `;
+    
+    container.appendChild(toast);
+    
+    // Add to history
+    notificationHistory.push({
+        id: toastId,
+        type: emergency ? 'emergency' : type,
+        title: title,
+        message: message,
+        timestamp: new Date().toLocaleTimeString(),
+        read: false
+    });
+    
+    updateNotificationBadge();
+    
+    // Auto-remove after duration (if not emergency or 0 duration)
+    if (duration > 0 && !emergency) {
+        setTimeout(() => {
+            removeToast(toastId);
+        }, duration);
+    }
+    
+    return toastId;
+}
+
+// Remove specific toast
+function removeToast(toastId) {
+    const toast = document.getElementById(toastId);
+    if (toast) {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(400px) scale(0.9)';
+        setTimeout(() => {
+            if (toast.parentElement) {
+                toast.remove();
+            }
+        }, 300);
+    }
+    
+    // Mark as read in history
+    notificationHistory = notificationHistory.map(notif => 
+        notif.id === toastId ? {...notif, read: true} : notif
+    );
+    updateNotificationBadge();
+}
+
+// Clear all toasts
+function clearAllToasts() {
+    const container = document.getElementById('toastContainer');
+    if (container) {
+        const toasts = container.querySelectorAll('.toast');
+        toasts.forEach(toast => {
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateX(400px) scale(0.9)';
+        });
+        
+        setTimeout(() => {
+            container.innerHTML = '';
+        }, 300);
+    }
+    
+    // Mark all as read
+    notificationHistory = notificationHistory.map(notif => ({...notif, read: true}));
+    updateNotificationBadge();
+}
+
+// Show alert modal (for confirmations, errors, etc.)
+function showAlert(type, title, message, subtitle = '', details = '', options = {}) {
+    const overlay = document.getElementById('alertOverlay');
+    const modal = document.getElementById('alertModal');
+    const header = document.getElementById('alertHeader');
+    const icon = document.getElementById('alertIcon');
+    const iconSymbol = document.getElementById('alertIconSymbol');
+    const primaryBtn = document.getElementById('alertPrimaryBtn');
+    const secondaryBtn = document.getElementById('alertSecondaryBtn');
+    const dangerBtn = document.getElementById('alertDangerBtn');
+    
+    if (!overlay || !modal) {
+        console.error('Alert elements not found');
+        return;
+    }
+    
+    // Remove previous classes
+    header.className = 'alert-header';
+    header.classList.add(type);
+    
+    // Set icon
+    const iconMap = {
+        'success': { symbol: '✓', color: '#28a745' },
+        'warning': { symbol: '⚠', color: '#ffc107' },
+        'error': { symbol: '✗', color: '#dc3545' },
+        'info': { symbol: 'ℹ', color: '#17a2b8' }
+    };
+    
+    iconSymbol.textContent = iconMap[type]?.symbol || 'ℹ';
+    icon.style.color = iconMap[type]?.color || '#173681';
+    
+    // Set text content
+    document.getElementById('alertTitle').textContent = title;
+    document.getElementById('alertSubtitle').textContent = subtitle;
+    document.getElementById('alertMessage').textContent = message;
+    
+    // Set details if provided
+    const detailsEl = document.getElementById('alertDetails');
+    if (details) {
+        detailsEl.textContent = details;
+        detailsEl.style.display = 'block';
+    } else {
+        detailsEl.style.display = 'none';
+    }
+    
+    // Configure buttons
+    primaryBtn.textContent = options.primaryText || 'OK';
+    primaryBtn.style.display = 'inline-block';
+    secondaryBtn.style.display = 'none';
+    dangerBtn.style.display = 'none';
+    
+    if (options.secondaryText) {
+        secondaryBtn.textContent = options.secondaryText;
+        secondaryBtn.style.display = 'inline-block';
+    }
+    
+    if (options.dangerText) {
+        dangerBtn.textContent = options.dangerText;
+        dangerBtn.style.display = 'inline-block';
+    }
+    
+    // Set button actions
+    primaryBtn.onclick = options.primaryAction || hideAlert;
+    secondaryBtn.onclick = options.secondaryAction || hideAlert;
+    dangerBtn.onclick = options.dangerAction || hideAlert;
+    
+    // Show the alert
+    overlay.style.display = 'flex';
+    setTimeout(() => {
+        modal.style.transform = 'translateY(0)';
+    }, 10);
+    
+    // Return promise for async handling
+    return new Promise((resolve) => {
+        const resolveWith = (value) => {
+            hideAlert();
+            resolve(value);
+        };
+        
+        primaryBtn.onclick = () => resolveWith(options.primaryValue || true);
+        if (options.secondaryText) {
+            secondaryBtn.onclick = () => resolveWith(options.secondaryValue || false);
+        }
+        if (options.dangerText) {
+            dangerBtn.onclick = () => resolveWith(options.dangerValue || 'danger');
+        }
+    });
+}
+
+// Hide alert modal
+function hideAlert() {
+    const overlay = document.getElementById('alertOverlay');
+    const modal = document.getElementById('alertModal');
+    
+    if (overlay && modal) {
+        modal.style.transform = 'translateY(20px)';
+        setTimeout(() => {
+            overlay.style.display = 'none';
+        }, 300);
+    }
+}
+
+// Update notification badge
+function updateNotificationBadge() {
+    const badge = document.getElementById('notificationCount');
+    const bell = document.getElementById('notificationBell');
+    
+    if (!badge || !bell) return;
+    
+    const unreadCount = notificationHistory.filter(n => !n.read).length;
+    
+    if (unreadCount > 0) {
+        badge.textContent = unreadCount > 99 ? '99+' : unreadCount;
+        bell.style.display = 'block';
+    } else {
+        bell.style.display = 'none';
+    }
+}
+
+// Show connection status notification
+function showConnectionNotification(connected, port = null, message = '') {
+    if (connected) {
+        showToast('success', 'Connected', 
+            port ? `Successfully connected to ${port}` : 'Serial connection established',
+            3000
+        );
+    } else {
+        showToast('error', 'Disconnected', 
+            message || 'Serial connection lost',
+            3000
+        );
+    }
+}
+
+// Show command feedback
+function showCommandFeedback(command, success, message = '') {
+    const cmdMap = {
+        'e': 'IMU Streaming',
+        'i': 'GPS Activation',
+        'q': 'Stop Command',
+        'm1': 'Motor 1 Test',
+        'm2': 'Motor 2 Test', 
+        'm3': 'Motor 3 Test',
+        'm4': 'Motor 4 Test',
+        't': 'Tare IMU'
+    };
+    
+    const cmdName = cmdMap[command] || command;
+    
+    if (success) {
+        showToast('success', 'Command Sent', 
+            `${cmdName} command executed successfully`,
+            2000
+        );
+    } else {
+        showToast('error', 'Command Failed', 
+            message || `Failed to send ${cmdName} command`,
+            3000
+        );
+    }
+}
+
+// Show data export notification
+function showExportNotification(success, filename = '', message = '') {
+    if (success) {
+        showToast('success', 'Export Complete', 
+            filename ? `Data saved to ${filename}` : 'Data exported successfully',
+            3000
+        );
+    } else {
+        showToast('error', 'Export Failed', 
+            message || 'Failed to export data',
+            2000
+        );
+    }
+}
+
+// Show firmware upload notification
+function showUploadNotification(success, message = '') {
+    if (success) {
+        showToast('success', 'Firmware Uploaded', 
+            'Firmware uploaded successfully',
+            2000
+        );
+    } else {
+        showAlert('error', 'Upload Failed', 
+            'Firmware upload failed',
+            'Please check connection and try again',
+            message
+        );
+    }
+}
+
+// Initialize notification system
+function initNotificationSystem() {
+    // Close alert when clicking outside
+    document.addEventListener('click', function(event) {
+        const overlay = document.getElementById('alertOverlay');
+        const modal = document.getElementById('alertModal');
+        
+        if (overlay && modal && event.target === overlay) {
+            hideAlert();
+        }
+    });
+    
+    // Close alert with Escape key
+    document.addEventListener('keydown', function(event) {
+        if (event.key === 'Escape') {
+            hideAlert();
+        }
+    });
+    
+    console.log('Notification system initialized');
+}
+
+// Add to DOMContentLoaded event listener
+document.addEventListener('DOMContentLoaded', function() {
+    initNotificationSystem();
+    
+    // Test notification on startup
+    setTimeout(() => {
+        showToast('info', 'System Ready', 'Drone Control Center initialized successfully', 3000);
+    }, 1000);
+});
+
+
+function clearDataCallbacks() {
+    dataCallbacks = [];
+}
+
+function processSerialData(data) {
+    if (data && data.length > 0) {
+        console.log('Processing serial data:', data.substring(0, 100)); // Log first 100 chars
+        dataCallbacks.forEach(callback => {
+            try {
+                callback(data);
+            } catch (error) {
+                console.error('Error in data callback:', error);
+            }
+        });
+    }
+}
+
+function updateConnectionStatus(pageElementId, statusText) {
+    const statusElement = document.getElementById(pageElementId);
+    if (statusElement) {
+        const isMapStatus = statusElement.classList.contains('map-status');
+        statusElement.textContent = statusText;
+        
+        if (isConnected) {
+            statusElement.classList.remove('info', 'error');
+            statusElement.classList.add(isMapStatus ? 'active' : 'success');
+        } else {
+            statusElement.classList.remove('success', 'active');
+            statusElement.classList.add('info');
+        }
+    }
+}
+
+function updateElement(id, value) {
+    const element = document.getElementById(id);
+    if (element) {
+        element.textContent = value;
+        if (id !== 'armStatus') element.className = 'data-value';
+    }
+}
+
+// Update motor button styling when active
+function updateMotorButtonState(motorCmd, active) {
+    const motorButtons = document.querySelectorAll('.motor-btn');
+    motorButtons.forEach(btn => {
+        if (btn.dataset.cmd === motorCmd) {
+            if (active) {
+                btn.classList.add('motor-active');
+                btn.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ${btn.textContent.replace(' (ACTIVE)', '')} (ACTIVE)`;
+            } else {
+                btn.classList.remove('motor-active');
+                btn.innerHTML = btn.innerHTML.replace(' (ACTIVE)', '');
+            }
+        }
+    });
+    
+    // Update danger zone styling
+    const dangerZone = document.querySelector('.danger-zone');
+    if (dangerZone) {
+        if (active) {
+            dangerZone.classList.add('danger-zone-active');
+        } else {
+            dangerZone.classList.remove('danger-zone-active');
+        }
+    }
+}
+
+// Monitor motor state and update UI
+setInterval(() => {
+    if (activeMotorCommand) {
+        updateMotorButtonState(activeMotorCommand, true);
+    } else {
+        // Reset all motor buttons
+        const motorButtons = document.querySelectorAll('.motor-btn');
+        motorButtons.forEach(btn => {
+            btn.classList.remove('motor-active');
+            const btnText = btn.textContent || btn.innerText;
+            if (btnText.includes(' (ACTIVE)')) {
+                btn.innerHTML = btn.innerHTML.replace(' (ACTIVE)', '');
+            }
+        });
+        
+        // Reset danger zone
+        const dangerZone = document.querySelector('.danger-zone');
+        if (dangerZone) {
+            dangerZone.classList.remove('danger-zone-active');
+        }
+    }
+}, 1000);
+
+// Emergency stop function
+async function emergencyStopMotor() {
+    console.log('Emergency stop activated!');
+    
+    // Send stop command
+    const success = await sendDashboardCommand('q');
+    
+    if (success) {
+        // Remove active motor toast if exists
+        if (activeMotorToast) {
+            removeToast(activeMotorToast);
+        }
+        
+        // Show emergency stop confirmation
+        await showAlert('error', 'EMERGENCY STOP',
+            'All motors have been stopped!',
+            'Safety system activated',
+            'Motor power has been cut. Verify all motors have stopped spinning.',
+            {
+                primaryText: 'Acknowledged',
+                primaryValue: 'acknowledge'
+            }
+        );
+        
+        // Show follow-up safety check
+        setTimeout(() => {
+            showAlert('warning', 'Safety Check',
+                'Please perform a safety check:',
+                'After emergency stop procedure',
+                `1. Visually confirm all motors have stopped
+2. Check for any damage or loose components
+3. Verify battery connections are secure
+4. Ensure props are still properly mounted
+5. Check system temperature`,
+                {
+                    primaryText: 'Safety Check Complete',
+                    secondaryText: 'Need Help',
+                    primaryValue: 'complete',
+                    secondaryValue: 'help'
+                }
+            ).then(result => {
+                if (result === 'complete') {
+                    showToast('success', 'Safety Check Complete',
+                        'System ready for normal operation', 3000);
+                } else if (result === 'help') {
+                    showAlert('info', 'Need Assistance?',
+                        'If you need help or detected an issue:',
+                        'Safety is our priority',
+                        `1. Disconnect battery immediately
+2. Keep clear of the drone
+3. Contact technical support
+4. Do not attempt to restart if unsafe`,
+                        {
+                            primaryText: 'Understood',
+                            primaryValue: 'understood'
+                        }
+                    );
+                }
+            });
+        }, 1000);
+    } else {
+        showAlert('error', 'Emergency Stop Failed',
+            'Failed to send stop command!',
+            'Manual intervention required',
+            'Please manually disconnect power immediately.',
+            {
+                primaryText: 'Power Disconnected',
+                dangerText: 'Still Running',
+                primaryValue: 'disconnected',
+                dangerValue: 'running'
+            }
+        ).then(result => {
+            if (result === 'running') {
+                showAlert('error', '⚠️ CRITICAL WARNING ⚠️',
+                    'Motor still appears to be running!',
+                    'Take IMMEDIATE action',
+                    `1. Do NOT approach the drone
+2. Cut power at the source (unplug battery)
+3. Clear the area
+4. Wait for motors to stop completely
+5. Contact emergency support if needed`,
+                    {
+                        primaryText: 'Power Cut - Safe Now',
+                        dangerText: 'STILL UNSAFE',
+                        primaryValue: 'safe',
+                        dangerValue: 'unsafe'
+                    }
+                );
+            }
+        });
+    }
+    
+    // Reset motor state
+    activeMotorCommand = null;
+    activeMotorToast = null;
+}
+
+// Updated function to handle RC sliders
+function updateSlider(prefix, rawValue) {
+    console.log(`updateSlider called: prefix=${prefix}, rawValue="${rawValue}"`);
+    
+    let val = 1500; // Default center value
+    
+    if (typeof rawValue === 'string') {
+        rawValue = rawValue.trim();
+        console.log(`Processing string value: "${rawValue}"`);
+        
+        // Extract ALL digits from the string
+        const digits = rawValue.match(/\d+/g);
+        if (digits && digits.length > 0) {
+            // Take the last sequence of digits (should be the number)
+            val = parseInt(digits[digits.length - 1]);
+            console.log(`Extracted digits: ${digits}, using: ${val}`);
+        } else {
+            console.log(`No digits found, using default: 1500`);
+        }
+    } else if (typeof rawValue === 'number') {
+        val = rawValue;
+        console.log(`Numeric value directly: ${val}`);
+    }
+    
+    console.log(`Parsed value: ${val}`);
+    
+    // Clamp to 1000-2000 range
+    if (val < 1000) val = 1000;
+    if (val > 2000) val = 2000;
+    
+    // Calculate percentage
+    let percent = 0;
+    if (val <= 1000) {
+        percent = 0;
+    } else if (val >= 2000) {
+        percent = 100;
+    } else {
+        percent = ((val - 1000) / 1000) * 100;
+    }
+    
+    console.log(`Calculation: ${val} → ${percent.toFixed(1)}%`);
+
+    const fillEl = document.getElementById(prefix + 'Fill');
+    const textEl = document.getElementById(prefix + 'Text');
+    
+    if (fillEl) {
+        fillEl.style.width = percent + '%';
+    }
+    
+    if (textEl) {
+        textEl.textContent = Math.round(percent) + '%';
+        textEl.style.color = '#8a2be2';
+        textEl.style.fontWeight = 'bold';
+    }
+    
+    return percent;
+}
+// ==================== BETAFLIGHT-STYLE ROTATION FUNCTIONS ====================
+
+function applyBetaflightRotation() {
+    if (!droneModel) return;
+    
+    if (useQuaternions) {
+        const euler = new THREE.Euler(
+            THREE.MathUtils.degToRad(currentRotation.pitch),
+            THREE.MathUtils.degToRad(currentRotation.yaw),
+            THREE.MathUtils.degToRad(currentRotation.roll),
+            'YXZ'
+        );
+        
+        const targetQuaternion = new THREE.Quaternion();
+        targetQuaternion.setFromEuler(euler);
+        droneModel.quaternion.slerp(targetQuaternion, rotationSmoothingFactor * 2);
+    } else {
+        droneModel.rotation.x = THREE.MathUtils.degToRad(currentRotation.pitch);
+        droneModel.rotation.y = THREE.MathUtils.degToRad(currentRotation.yaw);
+        droneModel.rotation.z = THREE.MathUtils.degToRad(currentRotation.roll);
+    }
+}
+
+function updateDroneRotation() {
+    currentRotation.yaw += (targetRotation.yaw - currentRotation.yaw) * rotationSmoothingFactor;
+    currentRotation.pitch += (targetRotation.pitch - currentRotation.pitch) * rotationSmoothingFactor;
+    currentRotation.roll += (targetRotation.roll - currentRotation.roll) * rotationSmoothingFactor;
+    applyBetaflightRotation();
+}
+
+function setTargetRotation(yaw, pitch, roll) {
+    targetRotation.yaw = -yaw;
+    targetRotation.pitch = pitch;
+    targetRotation.roll = -roll;
+}
+
+function resetRotation() {
+    targetRotation = { yaw: 0, pitch: 0, roll: 0 };
+    currentRotation = { yaw: 0, pitch: 0, roll: 0 };
+    if (droneModel) {
+        droneModel.rotation.set(0, 0, 0);
+        droneModel.quaternion.identity();
+    }
+}
+
+// ==================== SHARED SERIAL COMMUNICATION FUNCTIONS ====================
+
+async function connectSerial(port, baud, statusElementId) {
+    if (!port) {
+        showAlert('error', 'Connection Error', 'Please select a COM port first');
+        return false;
+    }
+
+    try {
+        console.log(`Connecting to ${port} at ${baud} baud...`);
+        const connectingToastId = showToast('connection', 'Connecting', `Attempting to connect to ${port}...`, 0);
+        const response = await fetch('/api/serial/connect', {
+            method: 'POST',
+
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                port: port,
+                baud_rate: parseInt(baud)
+            })
+        });
+
+        const result = await response.json();
+        console.log('Connection result:', result);
+        
+        removeToast(connectingToastId);
+
+        if (result.success) {
+            isConnected = true;
+            currentPort = port;
+            currentBaud = baud;
+            startSerialPolling();
+            updateConnectionStatus(statusElementId, `Connected to ${port} at ${baud} baud`);
+            document.querySelectorAll('.connect-btn').forEach(btn => {
+                btn.textContent = 'Disconnect';
+                btn.classList.add('connected');
+            });
+
+            // show notification from server
+            if (result.notification){
+                showToast(result.notification.type, result.notification.title, result.notification.message, result.notification.duration || 2000);
+            }
+            return true;
+        } else {
+            isConnected = false;
+            updateConnectionStatus(statusElementId, `Failed: ${result.message}`);
+
+            if (result.notification){
+                showToast(result.notification.type, result.notification.title, result.notification.message, result.notification.duration || 5000);
+            }
+            return false;
+        }
+    } catch (error) {
+        isConnected = false;
+        console.error('Connection error:', error);
+        updateConnectionStatus(statusElementId, `Connection error: ${error.message}`);
+
+        showToast('error', 'Connection Error', `Failed to connect: ${error.message}`, 2000);
+        return false;
+    }
+}
+
+async function disconnectSerial(statusElementId) {
+    try {
+        console.log('Disconnecting serial...');
+        const response = await fetch('/api/serial/disconnect', { method: 'POST' });
+        const result = await response.json();
+
+        isConnected = false;
+        currentPort = null;
+        stopSerialPolling();
+        updateConnectionStatus(statusElementId, 'Disconnected');
+        document.querySelectorAll('.connect-btn').forEach(btn => {
+            btn.textContent = 'Connect';
+            btn.classList.remove('connected');
+        });
+
+        if (result.notification) {
+            showToast(result.notification.type, result.notification.title, result.notification.message, result.notification.duration || 3000);
+        }
+        return true;
+    } catch (error) {
+        console.error('Disconnect error:', error);
+        updateConnectionStatus(statusElementId, `Disconnect error: ${error.message}`);
+
+        showToast('error', 'Disconnect Error', `Failed to disconnect: ${error.message}`, 2000);
+        return false;
+    }
+}
+
+// NEW: Enhanced sendSerial function for all commands
+async function sendSerial(message, lineEnding = 'lf', statusElementId) {
+    if (!isConnected) {
+        showToast('error','Not Connected','Connect to serial port first');
+        updateConnectionStatus(statusElementId, 'Not connected to serial port');
+        return false;
+    }
+    
+    try {
+        console.log(`Sending serial: ${message} (line ending: ${lineEnding})`);
+        const response = await fetch('/api/serial/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                message: message,
+                line_ending: lineEnding
+            })
+        });
+
+        const result = await response.json();
+        console.log('Send result:', result);
+        
+        if (!result.success) {
+            updateConnectionStatus(statusElementId, `Send failed: ${result.message}`);
+
+            //show error notification
+            if (result.notification){
+                showToast(result.notification.type, result.notification.title, result.notification.message, result.notification.duration || 2000);
+            }
+
+            return false;
+        }
+
+        //show success notification
+        if (result.notification){
+            showToast(result.notification.type, result.notification.title, result.notification.message, result.notification.duration || 2000);
+        }
+        return true;
+    } catch (error) {
+        console.error('Send error:', error);
+        updateConnectionStatus(statusElementId, `Send error: ${error.message}`);
+        showToast('error', 'Send Error', `Failed to send command: ${error.message}`, 2000);
+        return false;
+    }
+}
+
+// NEW: Function to send command with the pattern (q once, then command twice)
+async function sendCommandWithPattern(command, statusElementId) {
+    console.log(`Sending command with pattern: ${command}`);
+    
+    if (!isConnected) {
+        showToast('error','Not Connected','Connect to serial port first');
+        updateConnectionStatus(statusElementId, 'Not connected to serial port');
+        return false;
+    }
+    
+    try {
+        // Send stop command 'q' once first
+        console.log(`Step 1: Sending stop command 'q'`);
+        const stopSuccess = await sendSerial('q', 'lf', statusElementId);
+        if (!stopSuccess) {
+            console.error('Failed to send stop command');
+            showToast('error', 'Command Failed', 'Failed to send stop command');
+            return false;
+        }
+        
+        // Wait 150ms
+        await new Promise(resolve => setTimeout(resolve, 150));
+        
+        // Send the actual command twice with delay
+        console.log(`Step 2: Sending ${command} command first time`);
+        const firstSuccess = await sendSerial(command, 'lf', statusElementId);
+        if (!firstSuccess) {
+            console.error(`Failed to send ${command} command first time`);
+            showToast('error', 'Command Failed', `Failed to send ${command} command`);
+            return false;
+        }
+        
+        // Wait 150ms
+        await new Promise(resolve => setTimeout(resolve, 150));
+        
+        console.log(`Step 3: Sending ${command} command second time`);
+        const secondSuccess = await sendSerial(command, 'lf', statusElementId);
+        
+        if (secondSuccess) {
+            console.log(`Successfully sent ${command} command with pattern`);
+            showCommandFeedback(command, true);
+            return true;
+        } else {
+            console.error(`Failed to send ${command} command second time`);
+            showCommandFeedback(command, false);
+            return false;
+        }
+    } catch (error) {
+        console.error(`Error in sendCommandWithPattern for ${command}:`, error);
+        updateConnectionStatus(statusElementId, `Error sending ${command}: ${error.message}`);
+        showToast('error', 'Command Error', `Failed to send ${command} command: ${error.message}`, 2000);
+        return false;
+    }
+}
+
+// NEW: Function to send command normally (for PID commands that use colon syntax)
+async function sendCommandNormal(command, statusElementId) {
+    console.log(`Sending command normally: ${command}`);
+    
+    if (!isConnected) {
+        showToast('error','Not Connected','Connect to serial port first');
+        updateConnectionStatus(statusElementId, 'Not connected to serial port');
+        return false;
+    }
+    
+    try {
+        return await sendSerial(command, 'lf', statusElementId);
+    } catch (error) {
+        console.error(`Error in sendCommandNormal for ${command}:`, error);
+        showToast('error', 'Command Error', `Failed to send ${command}: ${error.message}`, 2000);
+        return false;
+    }
+}
+
+function startSerialPolling() {
+    stopSerialPolling();
+    console.log('Starting serial polling...');
+    serialDataPoll = setInterval(async () => {
+        if (!isConnected) { 
+            stopSerialPolling(); 
+            return; 
+        }
+        try {
+            const response = await fetch('/api/serial/data');
+            if (!response.ok) {
+                console.error('Failed to fetch serial data');
+                return;
+            }
+            const data = await response.json();
+            if (data.data) {
+                processSerialData(data.data);
+            }
+        } catch (error) { 
+            console.error('Error polling serial data:', error); 
+        }
+    }, 100);
+}
+
+function stopSerialPolling() {
+    if (serialDataPoll) { 
+        clearInterval(serialDataPoll); 
+        serialDataPoll = null;
+        console.log('Stopped serial polling');
+    }
+}
+
+// ==================== NAVIGATION / PAGE LOADING FUNCTIONS ====================
+
+function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    const overlay = document.getElementById('overlay');
+    sidebar.classList.toggle('open');
+    overlay.classList.toggle('active');
+}
+
+function closeSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    const overlay = document.getElementById('overlay');
+    sidebar.classList.remove('open');
+    overlay.classList.remove('active');
+}
+
+async function switchPage(pageId) {
+    const pageConfig = pageMap[pageId];
+    const dynamicContent = document.getElementById('dynamic-content');
+    const navLinks = document.querySelectorAll('.nav-link');
+    
+    if (!pageConfig) return;
+    
+    navLinks.forEach(link => {
+        link.classList.remove('active');
+        if (link.getAttribute('href') === pageId) link.classList.add('active');
+    });
+    
+    // Don't clear data callbacks - we want to keep receiving data
+    
+    // Clear Map Poll if leaving map page
+    if (mapUpdatePoll && pageId !== '#maps') { 
+        clearInterval(mapUpdatePoll); 
+        mapUpdatePoll = null; 
+    }
+    
+    closeSidebar();
+
+    dynamicContent.innerHTML = '<div class="container">Loading...</div>';
+    
+    try {
+        const response = await fetch(pageConfig.url);
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        const html = await response.text();
+        
+        dynamicContent.innerHTML = html;
+        
+        // Always add console logging for debugging
+        addDataCallback((data) => {
+            console.log('Raw serial data:', data);
+        });
+        
+        const initFunction = window[pageConfig.init];
+        if (typeof initFunction === 'function') {
+            initFunction();
+        }
+        
+        // Update connection buttons
+        document.querySelectorAll('.connect-btn').forEach(btn => {
+            btn.textContent = isConnected ? 'Disconnect' : 'Connect';
+            if (isConnected) btn.classList.add('connected');
+            else btn.classList.remove('connected');
+        });
+        
+    } catch (error) {
+        console.error('Page load error:', error);
+        dynamicContent.innerHTML = `<div class="container"><div class="status error">Error loading content: ${error.message}</div></div>`;
+    }
+}
+
+// ==================== PAGE-SPECIFIC INITIALIZATION FUNCTIONS ====================
+
+// --- MAP INITIALIZER (FIXED) ---
+function initializeMap() {
+    console.log('Initializing map...');
+    
+    const statusBox = document.getElementById('gps-status-box');
+    const mapStatusId = 'mapStatus';
+    const connectBtn = document.getElementById('mapConnectBtn');
+    const activateBtn = document.getElementById('activateGpsBtn');
+    const portSelect = document.getElementById('port');
+    const baudSelect = document.getElementById('baud');
+
+    // Initialize Leaflet map
+    const mapContainer = document.getElementById('map');
+    if (mapContainer) {
+        if (!mapInstance) {
+            console.log('Creating new map instance');
+            mapInstance = L.map('map').setView([22.719568, 75.857727], 15);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors',
+                maxZoom: 19
+            }).addTo(mapInstance);
+            
+            mapPolyline = L.polyline([], {color: 'red'}).addTo(mapInstance);
+        }
+        
+        // Force map resize after container is visible
+        setTimeout(() => {
+            if (mapInstance) {
+                mapInstance.invalidateSize();
+                console.log('Map resized');
+            }
+        }, 300);
+    }
+
+    // Function to update map with GPS data
+    const updateMapDashboard = (data) => {
+        if (data) {
+            console.log('Map data:', data);
+            
+            if (data.valid) {
+                if (statusBox) {
+                    statusBox.innerHTML = '<i class="fas fa-satellite-dish"></i> GPS Active';
+                    statusBox.classList.add('active');
+                }
+                
+                if (data.lat && data.lon) {
+                    const latLng = [data.lat, data.lon];
+                    if (!mapMarker) {
+                        mapMarker = L.marker(latLng).addTo(mapInstance).bindPopup("Current Position").openPopup();
+                    } else {
+                        mapMarker.setLatLng(latLng);
+                    }
+                    mapPolyline.addLatLng(latLng);
+                    mapInstance.setView(latLng);
+                }
+            }
+
+            // Update GPS data displays
+            ['lat', 'lon', 'speed', 'alt', 'sats', 'hdop', 'vdop'].forEach(key => {
+                const el = document.getElementById(key);
+                if (el) {
+                    let value = '--';
+                    if (key === 'lat' && data.lat !== undefined) value = parseFloat(data.lat).toFixed(6);
+                    else if (key === 'lon' && data.lon !== undefined) value = parseFloat(data.lon).toFixed(6);
+                    else if (key === 'speed' && data.speed !== undefined) value = parseFloat(data.speed).toFixed(1);
+                    else if (key === 'alt' && data.altitude !== undefined) value = data.altitude;
+                    else if (key === 'sats' && data.satellites !== undefined) value = data.satellites;
+                    else if (key === 'hdop' && data.hdop !== undefined) value = parseFloat(data.hdop).toFixed(2);
+                    else if (key === 'vdop' && data.vdop !== undefined) value = parseFloat(data.vdop).toFixed(2);
+                    
+                    el.textContent = value;
+                }
+            });
+            
+            if (data.last_update) {
+                const timeEl = document.getElementById('time');
+                if (timeEl) timeEl.textContent = data.last_update;
+            }
+        }
+    };
+
+    // Poll for map data (GPS parsing)
+    const pollMapData = async () => {
+        try {
+            const res = await fetch('/api/map/data');
+            const data = await res.json();
+            updateMapDashboard(data);
+        } catch (e) { 
+            console.error('Map poll error', e); 
+        }
+    };
+
+    // Start polling for map data
+    if (mapUpdatePoll) clearInterval(mapUpdatePoll);
+    mapUpdatePoll = setInterval(pollMapData, 1000);
+    pollMapData();
+
+    // Set up button handlers
+    if (connectBtn) {
+        connectBtn.onclick = async () => {
+            if (isConnected) {
+                await disconnectSerial(mapStatusId);
+            } else {
+                const port = portSelect ? portSelect.value : currentPort;
+                const baud = baudSelect ? baudSelect.value : currentBaud;
+                if (port) {
+                    await connectSerial(port, baud, mapStatusId);
+                } else {
+                    showAlert('error', 'Connection Error', 'Please select a COM port first');
+                }
+            }
+        };
+    }
+    
+    if (activateBtn) {
+        activateBtn.onclick = async () => {
+            console.log('Activating GPS...');
+            
+            if (!isConnected) {
+                showAlert('error', 'Not Connected', 'Please connect to serial port first');
+                return;
+            }
+            
+            // Use the new command pattern for GPS command 'i'
+            await sendCommandWithPattern('i', mapStatusId);
+            
+            const statusEl = document.getElementById(mapStatusId);
+            if (statusEl) {
+                showStatus(statusEl, 'GPS activated (i command sent)', 'success');
+            }
+        };
+    }
+    
+    // Add callback to process serial data for GPS
+    const processGPSData = (data) => {
+        if (data.includes('$GPGGA') || data.includes('$GPRMC')) {
+            console.log('GPS sentence received:', data.substring(0, 50));
+        }
+    };
+    
+    addDataCallback(processGPSData);
+    
+    // Update connection status
+    if (isConnected) {
+        updateConnectionStatus(mapStatusId, `Connected to ${currentPort}`);
+    } else {
+        updateConnectionStatus(mapStatusId, 'Disconnected');
+    }
+    
+    console.log('Map initialization complete');
+}
+
+// --- PROGRAM UPLOADER INITIALIZER (FIXED) ---
+function initializeProgramUploader() {
+    console.log('Initializing program uploader...');
+    
+    const portSelect = document.getElementById('port');
+    const refreshPortsBtn = document.getElementById('refreshPorts');
+    const baudSelect = document.getElementById('baud');
+    const fileTypeSelect = document.getElementById('fileType');
+    const firmwareFile = document.getElementById('firmwareFile');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const serialLog = document.getElementById('serialLog');
+    const connectBtn = document.getElementById('connectBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const sendMessage = document.getElementById('sendMessage');
+    const lineEndingSelect = document.getElementById('lineEnding');
+    const sendBtn = document.getElementById('sendBtn');
+    const sendNewlineBtn = document.getElementById('sendNewlineBtn');
+
+    const addToLog = (text) => {
+        if (serialLog) {
+            serialLog.textContent += text;
+            serialLog.scrollTop = serialLog.scrollHeight;
+        }
+    };
+    
+    // Refresh available COM ports
+    const refreshPorts = async () => {
+        const statusElement = document.getElementById('serialStatus');
+        try {
+            console.log('Refreshing ports...');
+            const response = await fetch('/api/ports');
+            const ports = await response.json();
+            console.log('Available ports:', ports);
+            
+            if (portSelect) {
+                portSelect.innerHTML = '<option value="">Select port...</option>';
+                ports.forEach(port => {
+                    const option = document.createElement('option');
+                    option.value = port;
+                    option.textContent = port;
+                    portSelect.appendChild(option);
+                });
+                
+                // Select current port if connected
+                if (currentPort && ports.includes(currentPort)) {
+                    portSelect.value = currentPort;
+                }
+            }
+        } catch (error) {
+            console.error('Error refreshing ports:', error);
+            showStatus(statusElement, `Error refreshing ports: ${error.message}`, 'error');
+        }
+    };
+
+    // Upload firmware
+    const uploadFirmware = async () => {
+        const statusElement = document.getElementById('uploadStatus');
+        const progressBar = document.getElementById('progressBar');
+        
+        if (!portSelect || !portSelect.value) { 
+            showAlert('error', 'Upload Error', 'Please select a COM port first');
+            return; 
+        }
+        if (!firmwareFile || !firmwareFile.files[0]) { 
+            showAlert('error', 'Upload Error', 'Please select a firmware file');
+            return; 
+        }
+            // Confirm upload
+        const confirmed = await showAlert('warning', 'Upload Firmware', 
+            'Are you sure you want to upload firmware?',
+            'This will overwrite existing firmware on the device',
+            'WARNING: This operation cannot be undone!',
+            {
+                primaryText: 'Upload',
+                secondaryText: 'Cancel',
+                primaryValue: 'upload',
+                secondaryValue: 'cancel'
+            }
+        );
+    
+        if (confirmed !== 'upload') {
+            showToast('info', 'Upload Cancelled', 'Firmware upload cancelled');
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', firmwareFile.files[0]);
+        formData.append('port', portSelect.value);
+        formData.append('file_type', fileTypeSelect.value);
+        formData.append('baud_rate', baudSelect.value);
+
+        uploadBtn.disabled = true;
+        if (progressBar) progressBar.style.width = '50%';
+        const uploadToastId = showToast('info', 'Uploading', 'Firmware upload in progress...', 0);
+        try {
+            const response = await fetch('/api/upload', { method: 'POST', body: formData });
+            const result = await response.json();
+
+            removeToast(uploadToastId);
+            
+            if (result.success) {
+                if (progressBar) progressBar.style.width = '100%';
+                if (result.notification) {
+                showToast(result.notification.type, result.notification.title, result.notification.message, result.notification.duration || 2000);
+                }
+                 setTimeout(() => {
+                if (progressBar) progressBar.style.width = '0%';
+            }, 2000);
+            } else {
+                if (progressBar) progressBar.style.width = '0%';
+                if (result.notification) {
+                // Show error notification
+            if (result.notification) {
+                showAlert(result.notification.type, 
+                    result.notification.title, 
+                    result.notification.message,
+                    'Upload failed',
+                    result.message || '');
+            }
+                }
+            }
+        } catch (error) {
+            removeToast(uploadToastId);
+            if (progressBar) progressBar.style.width = '0%';
+
+            showAlert('error', 'Upload Error', 
+            'Firmware upload failed',
+            'Network or server error',
+            error.toString()
+        );
+
+        } finally {
+            uploadBtn.disabled = false;
+        }
+    };
+
+    // Toggle connection
+    const toggleConnection = async () => {
+        const statusElementId = 'serialStatus';
+        if (isConnected) {
+            await disconnectSerial(statusElementId);
+        } else {
+            if (!portSelect || !portSelect.value) {
+                showAlert('error', 'Connection Error', 'Please select a COM port first');
+                return;
+            }
+            await connectSerial(portSelect.value, baudSelect.value, statusElementId);
+        }
+    };
+    
+    // Clear log
+    const clearLog = () => {
+         if (serialLog) serialLog.textContent = '';
+    };
+
+    // Send message - using normal send for manual text input
+    const sendMsg = async (newline = false) => {
+        const statusElementId = 'serialStatus';
+        let lineEnding = lineEndingSelect ? lineEndingSelect.value : 'lf';
+        if (newline) lineEnding = 'lf';
+        
+        if (!sendMessage || !sendMessage.value.trim()) {
+            showAlert('warning', 'Empty Message', 'Please enter a message to send');
+            return;
+        }
+        
+        const success = await sendSerial(sendMessage.value, lineEnding, statusElementId);
+        
+        if (success) {
+            let logEntry = `> ${sendMessage.value}`;
+            if (lineEnding === 'lf') logEntry += '\\n';
+            else if (lineEnding === 'cr') logEntry += '\\r';
+            else if (lineEnding === 'crlf') logEntry += '\\r\\n';
+            else if (lineEnding === 'hex') logEntry = `> ${sendMessage.value} (HEX)`;
+            
+            addToLog(logEntry + '\n');
+            sendMessage.value = '';
+        }
+    };
+    
+    // Set up button handlers
+    if (refreshPortsBtn) refreshPortsBtn.onclick = refreshPorts;
+    if (uploadBtn) uploadBtn.onclick = uploadFirmware;
+    if (connectBtn) connectBtn.onclick = toggleConnection;
+    if (clearBtn) clearBtn.onclick = clearLog;
+    if (sendBtn) sendBtn.onclick = () => sendMsg(false);
+    if (sendNewlineBtn) sendNewlineBtn.onclick = () => sendMsg(true);
+    if (sendMessage) {
+        sendMessage.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMsg(false);
+            }
+        });
+    }
+    
+    // Add callback to log all serial data
+    addDataCallback(addToLog);
+    
+    // Initial refresh and status update
+    refreshPorts();
+    if (isConnected) {
+        updateConnectionStatus('serialStatus', `Connected to ${currentPort}`);
+    } else {
+        updateConnectionStatus('serialStatus', 'Disconnected');
+    }
+    
+    console.log('Program uploader initialization complete');
+}
+
+// --- DASHBOARD INITIALIZATION (FIXED) ---
+function initializeDashboard() {
+    console.log('Initializing dashboard...');
+    
+    const dashboardLog = document.getElementById('dashboardLog');
+    const dashboardStatusId = 'dashboardStatus';
+    const dashboardConnectBtn = document.getElementById('dashboardConnectBtn');
+    const dashboardClearBtn = document.getElementById('dashboardClearBtn');
+    const portSelect = document.getElementById('port');
+    const baudSelect = document.getElementById('baud');
+    
+    // Utility function for delays
+    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    
+    const addToDashboardLog = (text) => {
+        if (dashboardLog) {
+            dashboardLog.textContent += text;
+            dashboardLog.scrollTop = dashboardLog.scrollHeight;
+        }
+    };
+
+    // Data parsing functions
+    const parseRCPulseData = (line) => {
+    console.log('=== PARSING RC PULSE DATA ===');
+    console.log('Raw line:', line);
+    
+    // Extract all values using properly escaped regex
+    // We need to escape special characters like - and +
+    const patterns = {
+        start: /Start:(\d+)/,
+        // Match Roll: followed by any non-space characters (including -+-)
+        roll: /Roll:\s*(\S+)/,
+        pitch: /Pitch:\s*(\S+)/,
+        throttle: /Throttle:\s*(\S+)/,
+        yaw: /Yaw:\s*(\S+)/,
+        ch5: /CH5:\s*(\S+)/,
+        ch6: /CH6:\s*(\S+)/
+    };
+    
+    Object.entries(patterns).forEach(([key, pattern]) => {
+        const match = line.match(pattern);
+        if (match) {
+            const value = match[1];
+            console.log(`${key}: "${value}"`);
+            
+            if (key === 'start') {
+                const armStatus = parseInt(value);
+                const armElement = document.getElementById('armStatus');
+                if (armElement) {
+                    armElement.textContent = armStatus === 0 ? 'ARMED' : 'DISARMED';
+                    armElement.className = armStatus === 0 ? 'data-value armed' : 'data-value disarmed';
+                    console.log(`Arm status: ${armStatus === 0 ? 'ARMED' : 'DISARMED'}`);
+                }
+            } else {
+                // Map RC channel names to slider prefixes
+                const prefixMap = {
+                    'roll': 'roll',
+                    'pitch': 'pitch', 
+                    'throttle': 'throttle',
+                    'yaw': 'yaw',
+                    'ch5': 'ch5',
+                    'ch6': 'ch6'
+                };
+                
+                if (prefixMap[key]) {
+                    updateSlider(prefixMap[key], value);
+                }
+            }
+        } else {
+            console.log(`No match for ${key}`);
+        }
+    });
+    
+    // Also try alternative parsing method
+    console.log('Alternative parsing by splitting:');
+    const parts = line.split(/\s+/);
+    parts.forEach(part => {
+        console.log(`Part: "${part}"`);
+    });
+    
+    console.log('=== END RC PARSING ===\n');
+};
+    const parseIMUData = (line) => {
+        const pitchMatch = line.match(/Pitch:\s*([-\d.]+)/);
+        const rollMatch = line.match(/Roll:\s*([-\d.]+)/);
+        const yawMatch = line.match(/Yaw:\s*([-\d.]+)/);
+        const tempMatch = line.match(/Temp:\s*([-\d.]+)/);
+        
+        if (pitchMatch) updateElement('pitchAngle', pitchMatch[1] + '°');
+        if (rollMatch) updateElement('rollAngle', rollMatch[1] + '°');
+        if (yawMatch) updateElement('yawAngle', yawMatch[1] + '°');
+        if (tempMatch) updateElement('imuTemp', tempMatch[1] + '°C');
+    };
+
+    const parseGyroData = (line) => {
+        const xMatch = line.match(/Gyro_x\s*=\s*([-\d]+)/);
+        const yMatch = line.match(/Gyro_y\s*=\s*([-\d]+)/);
+        const zMatch = line.match(/Gyro_z\s*=\s*([-\d]+)/);
+        
+        if (xMatch) updateElement('gyroX', xMatch[1]);
+        if (yMatch) updateElement('gyroY', yMatch[1]);
+        if (zMatch) updateElement('gyroZ', zMatch[1]);
+    };
+
+    const parseAccelData = (line) => {
+        const xMatch = line.match(/ACC_x\s*=\s*([-\d]+)/);
+        const yMatch = line.match(/ACC_y\s*=\s*([-\d]+)/);
+        const zMatch = line.match(/ACC_z\s*=\s*([-\d]+)/);
+        
+        if (xMatch) updateElement('accelX', xMatch[1]);
+        if (yMatch) updateElement('accelY', yMatch[1]);
+        if (zMatch) updateElement('accelZ', zMatch[1]);
+    };
+
+    const parseBatteryData = (line) => {
+        const voltageMatch = line.match(/Voltage\s*=\s*([\d.]+)V/);
+        if (voltageMatch) {
+            updateElement('batteryVoltage', voltageMatch[1] + 'V');
+        }
+    };
+    
+    const parsePIDReadback = (line) => {
+        const match = line.match(/PID:([\w_]+)=([-\d.]+)/);
+        if (match) {
+            const varName = match[1];
+            const value = match[2];
+            const inputElement = document.querySelector(`input[data-pid-var="${varName}"]`);
+            if (inputElement) {
+                inputElement.value = value;
+                addToDashboardLog(`[PID Read] ${varName} = ${value}\n`);
+                showToast('info', 'PID Readback', `Read ${varName} = ${value}`, 2000);
+            }
+        }
+    };
+
+   const processDashboardData = (data) => {
+    console.log('Dashboard data received:', data.substring(0, 200));
+    
+    const lines = data.split('\n');
+    lines.forEach(line => {
+        line = line.trim();
+        if (!line) return;
+        
+        if (line.includes('Start:')) {
+            console.log('=== RC PULSE LINE ===');
+            console.log('Parsing:', line);
+            
+            // Test parsing with examples
+            if (line.includes('-+-1499')) {
+                console.log('Example: -+-1499 should show ~50%');
+            }
+            if (line.includes('vvv1297')) {
+                console.log('Example: vvv1297 should show ~29.7%');
+                // Calculation: (1297-1000)/1000*100 = 29.7%
+            }
+            if (line.includes('<<<1474')) {
+                console.log('Example: <<<1474 should show ~47.4%');
+                // Calculation: (1474-1000)/1000*100 = 47.4%
+            }
+            
+            parseRCPulseData(line);
+        }
+        else if (line.includes('Pitch:') && line.includes('Roll:') && line.includes('Yaw:')) {
+            parseIMUData(line);
+        }
+        else if (line.includes('Gyro_x =') || line.includes('Gyro_y =') || line.includes('Gyro_z =')) {
+            parseGyroData(line);
+        }
+        else if (line.includes('ACC_x =') || line.includes('ACC_y =') || line.includes('ACC_z =')) {
+            parseAccelData(line);
+        }
+        else if (line.includes('Voltage =')) {
+            parseBatteryData(line);
+        }
+        else if (line.startsWith('PID:')) {
+            parsePIDReadback(line);
+        }
+
+        addToDashboardLog(line + '\n');
+    });
+};
+    // NEW: Unified command sending function for ALL commands
+    const sendDashboardCommand = async (command) => {
+        console.log(`Dashboard: Sending command: ${command}`);
+        
+        if (!isConnected) {
+            showToast('error', 'Not Connected', 'Connect to serial port first');
+            addToDashboardLog(`[ERROR] Not connected - cannot send: ${command}\n`);
+            return false;
+        }
+        
+        try {
+            // For PID commands (containing ':'), send normally
+            if (command.includes(':')) {
+                const success = await sendCommandNormal(command, dashboardStatusId);
+                if (success) {
+                    addToDashboardLog(`>>> Sent PID command: ${command}\n`);
+                }
+                return success;
+            } 
+            // For all other commands (including 'e', 'i', 'q', motor commands, etc.), use the pattern
+            else {
+                // Special case: if command is 'q' (stop), just send it once normally
+                if (command === 'q') {
+                    const success = await sendSerial('q', 'lf', dashboardStatusId);
+                    if (success) {
+                        addToDashboardLog(`>>> Sent stop command: ${command}\n`);
+                    }
+                    return success;
+                }
+                
+                // For all other commands, use the pattern: q once, then command twice
+                const success = await sendCommandWithPattern(command, dashboardStatusId);
+                
+                if (success) {
+                    addToDashboardLog(`>>> Sent command with pattern: ${command}\n`);
+                    
+                    // Highlight the active button
+                    document.querySelectorAll('.cmd-btn, .motor-btn').forEach(btn => {
+                        btn.classList.remove('active-command');
+                        if (btn.dataset.cmd === command) {
+                            btn.classList.add('active-command');
+                            setTimeout(() => btn.classList.remove('active-command'), 1000);
+                        }
+                    });
+                }
+                
+                return success;
+            }
+        } catch (error) {
+            console.error('Error in sendDashboardCommand:', error);
+            addToDashboardLog(`[EXCEPTION] Error sending ${command}: ${error.message}\n`);
+            showToast('error', 'Command Error', `Failed to send ${command}: ${error.message}`, 3000);
+            return false;
+        }
+    };
+    
+    // PID command functions
+    const sendPIDCommand = async (type, varName, value) => {
+        const command = `${type}:${varName}${value ? '=' + value : ''}`;
+        await sendDashboardCommand(command);
+    };
+
+    const readAllPIDGains = async () => {
+        showToast('info', 'Reading PID Gains', 'Reading all PID values from device...', 2000);
+        
+        const inputs = document.querySelectorAll('input[data-pid-var]');
+        let readCount = 0;
+        
+        for (let i = 0; i < inputs.length; i++) {
+            const varName = inputs[i].dataset.pidVar;
+            await sendPIDCommand('R', varName, '');
+            await delay(30);
+            readCount++;
+        }
+        
+        showToast('success', 'PID Read Complete', `Successfully read ${readCount} PID values`, 3000);
+    };
+
+    const writeAllPIDGains = async () => {
+        // Get selected PID gains
+        const inputs = document.querySelectorAll('input[data-pid-var]');
+        let selectedGains = [];
+        let totalGains = 0;
+        
+        inputs.forEach(input => {
+            const checkbox = input.nextElementSibling;
+            if (checkbox && checkbox.checked) {
+                const varName = input.dataset.pidVar;
+                const value = input.value;
+                selectedGains.push({ varName, value });
+            }
+            totalGains++;
+        });
+        
+        if (selectedGains.length === 0) {
+            showAlert('warning', 'No Gains Selected', 
+                'No PID gains are selected for writing.',
+                'Please check the boxes next to the gains you want to write.',
+                `Total available gains: ${totalGains}\nSelected: 0`,
+                {
+                    primaryText: 'OK',
+                    primaryValue: 'ok'
+                }
+            );
+            return;
+        }
+        
+        // Show confirmation with details
+        const confirmed = await showAlert('warning', 'Write PID Gains', 
+            `Are you sure you want to write ${selectedGains.length} PID gain(s)?`,
+            '⚠️ CRITICAL OPERATION - This will change flight behavior! ⚠️',
+            `Selected gains to write:\n${selectedGains.map(g => `• ${g.varName} = ${g.value}`).join('\n')}\n\nWARNING: Incorrect PID values can cause instability or crashes!`,
+            {
+                primaryText: 'Write Gains',
+                secondaryText: 'Cancel',
+                dangerText: 'Stop',
+                primaryValue: 'write',
+                secondaryValue: 'cancel',
+                dangerValue: 'emergency'
+            }
+        );
+        
+        if (confirmed === 'write') {
+            let writtenCount = 0;
+            let failedCount = 0;
+            
+            // Show progress
+            const progressToastId = showToast('info', 'Writing PID Gains', 
+                `Writing ${selectedGains.length} gain(s)... 0/${selectedGains.length}`, 0);
+            
+            for (let i = 0; i < selectedGains.length; i++) {
+                const { varName, value } = selectedGains[i];
+                
+                // Update progress
+                removeToast(progressToastId);
+                const newProgressToastId = showToast('info', 'Writing PID Gains', 
+                    `Writing ${varName}=${value}... ${i+1}/${selectedGains.length}`, 0);
+                
+                try {
+                    await sendPIDCommand('W', varName, value);
+                    await delay(50);
+                    writtenCount++;
+                    
+                    // Show individual success
+                    showToast('success', 'PID Written', `${varName} = ${value}`, 1500);
+                    
+                } catch (error) {
+                    failedCount++;
+                    showToast('error', 'Write Failed', `Failed to write ${varName}: ${error.message}`, 3000);
+                }
+                
+                // Update for next iteration
+                progressToastId = newProgressToastId;
+            }
+            
+            // Remove progress toast
+            if (progressToastId) removeToast(progressToastId);
+            
+            // Show final result
+            if (failedCount === 0) {
+                showAlert('success', 'PID Write Complete', 
+                    `Successfully wrote ${writtenCount} PID gain(s)`,
+                    'All selected gains have been written to the device',
+                    `Successful: ${writtenCount}\nFailed: ${failedCount}\nTotal: ${selectedGains.length}`,
+                    {
+                        primaryText: 'OK',
+                        primaryValue: 'ok'
+                    }
+                );
+            } else {
+                showAlert('warning', 'Partial Write Complete', 
+                    `Wrote ${writtenCount} of ${selectedGains.length} gain(s)`,
+                    'Some gains may not have been written successfully',
+                    `Successful: ${writtenCount}\nFailed: ${failedCount}\nTotal: ${selectedGains.length}\n\nCheck logs for details.`,
+                    {
+                        primaryText: 'OK',
+                        dangerText: 'Retry Failed',
+                        primaryValue: 'ok',
+                        dangerValue: 'retry'
+                    }
+                ).then(result => {
+                    if (result === 'retry') {
+                        // Retry logic could be implemented here
+                        showToast('info', 'Retry', 'Manual retry required - check connection and try again', 3000);
+                    }
+                });
+            }
+            
+        } else if (confirmed === 'emergency') {
+            emergencyStopMotor();
+        } else {
+            showToast('info', 'Write Cancelled', 'PID gain write operation cancelled', 2000);
+        }
+    };
+    
+    // Set up button handlers
+    if (dashboardConnectBtn) {
+        dashboardConnectBtn.onclick = async () => {
+            const port = portSelect ? portSelect.value : currentPort;
+            const baud = baudSelect ? baudSelect.value : currentBaud;
+            if (isConnected) {
+                await disconnectSerial(dashboardStatusId);
+            } else {
+                if (port) {
+                    await connectSerial(port, baud, dashboardStatusId);
+                } else {
+                    showAlert('error', 'Connection Error', 'Please select a COM port first');
+                }
+            }
+        };
+    }
+
+    if (dashboardClearBtn) {
+        dashboardClearBtn.onclick = () => { 
+            if (dashboardLog) dashboardLog.textContent = ''; 
+            showToast('info', 'Log Cleared', 'Dashboard log cleared', 2000);
+        };
+    }
+
+    // Set up command buttons - ALL commands will use the pattern
+    const cmdButtons = document.querySelectorAll('.cmd-btn');
+    console.log(`Found ${cmdButtons.length} command buttons`);
+    
+    cmdButtons.forEach(btn => {
+        btn.onclick = (e) => { 
+            console.log('Command button clicked:', btn.dataset.cmd);
+            sendDashboardCommand(btn.dataset.cmd); 
+        };
+    });
+
+    // Set up motor buttons with custom notifications
+    const motorButtons = document.querySelectorAll('.motor-btn');
+    console.log(`Found ${motorButtons.length} motor buttons`);
+    
+    motorButtons.forEach(btn => {
+        btn.onclick = async (e) => {
+            const motorMap = {
+                'm1': 'Motor 1',
+                'm2': 'Motor 2',
+                'm3': 'Motor 3',
+                'm4': 'Motor 4'
+            };
+            
+            const motorName = motorMap[btn.dataset.cmd] || btn.dataset.cmd;
+            
+            // Use custom alert for confirmation
+            const confirmed = await showAlert('warning', 'Motor Test Warning',
+                `Are you sure you want to start Motor ${motorName} test?`,
+                '⚠️ EXTREME DANGER - Ensure props are OFF! ⚠️',
+                `This will activate ${motorName}. Make sure:
+• Props are removed or securely fastened
+• Drone is on a stable surface
+• All safety checks are complete
+• You are ready to emergency stop`,
+                {
+                    primaryText: 'Start Test',
+                    secondaryText: 'Cancel',
+                    dangerText: 'Stop',
+                    primaryValue: 'start',
+                    secondaryValue: 'cancel',
+                    dangerValue: 'emergency'
+                }
+            );
+            
+            if (confirmed === 'start') {
+                // Show safety countdown
+                const countdownToastId = showToast('warning', 'Safety Countdown',
+                    'Starting motor test in 3 seconds...', 0);
+                
+                // Countdown sequence
+                for (let i = 3; i > 0; i--) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    if (i === 3) {
+                        removeToast(countdownToastId);
+                        const newToastId = showToast('warning', 'Safety Countdown',
+                            `Starting in ${i}...`, 0);
+                        window.currentMotorToast = newToastId;
+                    } else {
+                        removeToast(window.currentMotorToast);
+                        const newToastId = showToast('warning', 'Safety Countdown',
+                            `Starting in ${i}...`, 0);
+                        window.currentMotorToast = newToastId;
+                    }
+                }
+                
+                // Remove final countdown toast
+                if (window.currentMotorToast) {
+                    removeToast(window.currentMotorToast);
+                }
+                
+                // Execute the motor command
+                const success = await sendDashboardCommand(btn.dataset.cmd);
+                
+                if (success) {
+                    // Show active motor warning
+                    activeMotorToast = showToast('warning', 'Motor Active',
+                        `${motorName} is now active! Keep clear!`, 0);
+                    
+                    // Store motor state
+                    activeMotorCommand = btn.dataset.cmd;
+                    
+                    // Create emergency stop button
+                    setTimeout(() => {
+                        const emergencyToastId = showToast('error', '⚠️ MOTOR ACTIVE ⚠️',
+                            `${motorName} is running. Click to emergency stop.`, 0, true);
+                        
+                        // Find the emergency toast and make it clickable
+                        setTimeout(() => {
+                            const emergencyToast = document.getElementById(emergencyToastId);
+                            if (emergencyToast) {
+                                emergencyToast.style.cursor = 'pointer';
+                                emergencyToast.style.boxShadow = '0 0 10px #ff0000';
+                                emergencyToast.onclick = () => {
+                                    emergencyStopMotor();
+                                    removeToast(emergencyToastId);
+                                };
+                            }
+                        }, 100);
+                    }, 500);
+                    
+                }
+            } else if (confirmed === 'emergency') {
+                // Emergency stop requested from confirmation dialog
+                emergencyStopMotor();
+            } else {
+                // Cancelled
+                showToast('info', 'Motor Test Cancelled',
+                    `${motorName} test was cancelled`, 2000);
+            }
+        };
+    });
+
+    // Set up stop button - special case for 'q' command
+    const stopBtn = document.querySelector('.stop-btn');
+    if (stopBtn) {
+        stopBtn.onclick = async (e) => {
+            if (activeMotorCommand) {
+                // If a motor is active, use emergency stop
+                await emergencyStopMotor();
+            } else {
+                // Normal stop command
+                await sendDashboardCommand('q');
+                showToast('info', 'Stop Command', 'Stop command sent to all systems', 2000);
+            }
+            document.querySelectorAll('.cmd-btn, .motor-btn').forEach(btn => {
+                btn.classList.remove('active-command');
+            });
+        };
+    }
+    
+    // Set up PID buttons
+    const readAllPidBtn = document.getElementById('readAllPidBtn');
+    const writeAllPidBtn = document.getElementById('writeAllPidBtn');
+    
+    if (readAllPidBtn) {
+        readAllPidBtn.onclick = readAllPIDGains;
+    }
+    
+    if (writeAllPidBtn) {
+        writeAllPidBtn.onclick = writeAllPIDGains;
+    }
+    
+    // Initialize sliders
+    ['roll', 'pitch', 'throttle', 'yaw', 'ch5', 'ch6'].forEach(id => updateSlider(id, 1000));
+    
+    // Initialize log
+    if (dashboardLog) {
+        dashboardLog.textContent = 'Dashboard ready. Connect to start receiving data.\n';
+    }
+    
+    // Add data callback
+    addDataCallback(processDashboardData);
+    
+    // Add raw data logging callback for debugging
+    addDataCallback((data) => {
+        console.log('Raw dashboard data:', data.substring(0, 100));
+    });
+
+    // Update connection status
+    if (isConnected) {
+        updateConnectionStatus(dashboardStatusId, `Connected to ${currentPort}`);
+    } else {
+        updateConnectionStatus(dashboardStatusId, 'Disconnected - Click Connect');
+    }
+    
+    console.log('Dashboard initialization complete');
+}
+
+// ==================== 3D SIMULATION FUNCTIONS ====================
+
+window.onWindowResize = () => {
+    const modelContainer = document.getElementById('model-container');
+    if (camera && renderer && modelContainer) {
+        camera.aspect = modelContainer.clientWidth / modelContainer.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(modelContainer.clientWidth, modelContainer.clientHeight);
+    }
+};
+
+function animate() {
+    requestAnimationFrame(animate);
+    if (controls) controls.update();
+    updateDroneRotation();
+    if (renderer && scene && camera) renderer.render(scene, camera);
+}
+
+function loadDroneModel() {
+    const loader = new THREE.OBJLoader();
+    const modelPath = '/models/drone_costum.obj'; 
+    
+    loader.load(
+        modelPath,
+        (object) => {
+            droneModel = object;
+            
+            const box = new THREE.Box3().setFromObject(droneModel);
+            const size = box.getSize(new THREE.Vector3());
+            
+            box.getCenter(droneModel.position).multiplyScalar(-1); 
+            
+            const maxDim = Math.max(size.x, size.y,size.z);
+            const scale = 2 / maxDim;
+            droneModel.scale.setScalar(scale);
+            
+            droneModel.position.y += 0.5 + ((size.y * scale) / 2);
+            
+            droneModel.quaternion.identity();
+            
+            droneModel.traverse((child) => {
+                if (child.isMesh) {
+                    if (!child.material || child.material.length === 0) {
+                        child.material = new THREE.MeshLambertMaterial({ color: 0x00ff00, wireframe: false });
+                    }
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            
+            scene.add(droneModel);
+            console.log('Drone model loaded');
+        },
+        (xhr) => { 
+            console.log((xhr.loaded / xhr.total * 100) + '% loaded'); 
+        },
+        (error) => {
+            console.error('Error loading OBJ model:', error);
+            createFallbackDroneModel();
+        }
+    );
+}
+
+function createFallbackDroneModel() {
+    console.log('Creating fallback drone model');
+    const droneGroup = new THREE.Group();
+    const bodyGeometry = new THREE.CylinderGeometry(0.3, 0.3, 0.1, 8);
+    const bodyMaterial = new THREE.MeshLambertMaterial({ color: 0x333333 });
+    const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
+    droneGroup.add(body);
+    
+    const armGeometry = new THREE.BoxGeometry(1.5, 0.05, 0.05);
+    const armMaterial = new THREE.MeshLambertMaterial({ color: 0x666666 });
+    
+    const arm1 = new THREE.Mesh(armGeometry, armMaterial); arm1.position.x = 0.75; droneGroup.add(arm1);
+    const arm2 = new THREE.Mesh(armGeometry, armMaterial); arm2.position.x = -0.75; droneGroup.add(arm2);
+    const arm3 = new THREE.Mesh(armGeometry, armMaterial); arm3.rotation.z = Math.PI / 2; arm3.position.y = 0.75; droneGroup.add(arm3);
+    const arm4 = new THREE.Mesh(armGeometry, armMaterial); arm4.rotation.z = Math.PI / 2; arm4.position.y = -0.75; droneGroup.add(arm4);
+    
+    const motorGeometry = new THREE.CylinderGeometry(0.15, 0.15, 0.1, 8);
+    const motorMaterial = new THREE.MeshLambertMaterial({ color: 0x888888 });
+    
+    const positions = [[0.75, 0, 0], [-0.75, 0, 0], [0, 0.75, 0], [0, -0.75, 0]];
+    positions.forEach(pos => {
+        const motor = new THREE.Mesh(motorGeometry, motorMaterial);
+        motor.position.set(pos[0], pos[1], 0);
+        droneGroup.add(motor);
+        
+        const propGeometry = new THREE.BoxGeometry(0.4, 0.02, 0.1);
+        const propMaterial = new THREE.MeshLambertMaterial({ color: 0xCCCCCC });
+        const propeller = new THREE.Mesh(propGeometry, propMaterial);
+        motor.add(propeller);
+    });
+    
+    const frontIndicator = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 8), new THREE.MeshLambertMaterial({ color: 0xFF0000 }));
+    frontIndicator.position.set(0, 0.9, 0); droneGroup.add(frontIndicator);
+    
+    const backIndicator = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 8), new THREE.MeshLambertMaterial({ color: 0x0000FF }));
+    backIndicator.position.set(0, -0.9, 0); droneGroup.add(backIndicator);
+    
+    droneGroup.position.y = 0.05;
+    droneGroup.quaternion.identity();
+    
+    droneModel = droneGroup;
+    scene.add(droneModel);
+}
+
+// --- 3D SIMULATOR INITIALIZATION (FIXED) ---
+function initializeSimulator() {
+    console.log('Initializing 3D simulator...');
+    
+    const simConnectBtn = document.getElementById('simConnectBtn');
+    const simStartBtn = document.getElementById('simStartBtn');
+    const simStatusId = 'simStatus';
+    const resetViewBtn = document.getElementById('resetView');
+    const resetOrientationBtn = document.getElementById('resetOrientation');
+    const toggleAxesBtn = document.getElementById('toggleAxes');
+    const toggleRotationBtn = document.getElementById('toggleRotation');
+    const smoothingSlider = document.getElementById('smoothingSlider');
+    const smoothingValue = document.getElementById('smoothingValue');
+    const portSelect = document.getElementById('port');
+    const baudSelect = document.getElementById('baud');
+    
+    const init3DScene = () => {
+        const modelContainer = document.getElementById('model-container');
+        if (!modelContainer) {
+            console.error('Model container not found');
+            return;
+        }
+        
+        if (modelContainer.querySelector('canvas')) {
+            window.onWindowResize();
+            return;
+        }
+        
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x11111b);
+        camera = new THREE.PerspectiveCamera(75, modelContainer.clientWidth / modelContainer.clientHeight, 0.1, 1000);
+        camera.position.set(5, 3, 5);
+        camera.lookAt(0, 0, 0);
+        
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(modelContainer.clientWidth, modelContainer.clientHeight);
+        renderer.shadowMap.enabled = true;
+        modelContainer.appendChild(renderer.domElement);
+        
+        scene.add(new THREE.AmbientLight(0x404040, 2));
+        const dl = new THREE.DirectionalLight(0xffffff, 1); 
+        dl.position.set(10, 10, 5); 
+        dl.castShadow = true; 
+        scene.add(dl);
+        
+        scene.add(new THREE.GridHelper(20, 20, 0x444444, 0x222222));
+        axesHelper = new THREE.AxesHelper(2); 
+        scene.add(axesHelper);
+        
+        loadDroneModel();
+        
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true; 
+        controls.dampingFactor = 0.05;
+        
+        animate();
+        console.log('3D scene initialized');
+    };
+
+    const processSimulatorData = (data) => {
+        console.log('Simulator data:', data.substring(0, 100));
+        
+        const lines = data.split('\n');
+        lines.forEach(line => {
+            line = line.trim(); 
+            if (!line) return;
+            
+            if (line.includes('Pitch:') && line.includes('Roll:') && line.includes('Yaw:')) {
+                const pitchMatch = line.match(/Pitch:\s*([-\d.]+)/);
+                const rollMatch = line.match(/Roll:\s*([-\d.]+)/);
+                const yawMatch = line.match(/Yaw:\s*([-\d.]+)/);
+                
+                if (pitchMatch && rollMatch && yawMatch) {
+                    let pitch = parseFloat(pitchMatch[1]);
+                    let roll = parseFloat(rollMatch[1]);
+                    let yaw = parseFloat(yawMatch[1]);
+                    
+                    if (Math.abs(pitch) > 400 || Math.abs(roll) > 400 || Math.abs(yaw) > 400) { 
+                        pitch = 0; 
+                        roll = 0; 
+                        yaw = 0; 
+                    }
+                    setTargetRotation(yaw, pitch, roll);
+                    
+                    updateElement('sim-pitch', pitch.toFixed(2) + '°');
+                    updateElement('sim-roll', roll.toFixed(2) + '°');
+                    updateElement('sim-yaw', yaw.toFixed(2) + '°');
+                }
+            }
+            else if (line.includes('Gyro_x =')) {
+                const x = line.match(/Gyro_x\s*=\s*([-\d]+)/); 
+                if (x) updateElement('sim-gyroX', x[1]);
+            }
+            else if (line.includes('ACC_x =')) {
+                const x = line.match(/ACC_x\s*=\s*([-\d]+)/); 
+                if (x) updateElement('sim-accelX', x[1]);
+            }
+        });
+    };
+    
+    // Create sensor displays
+    const createSensorDisplays = () => {
+        const container = document.getElementById('sensor-values');
+        if (container) {
+            container.innerHTML = '';
+            [{ key: 'yaw', label: 'Yaw', unit: '°' }, 
+             { key: 'pitch', label: 'Pitch', unit: '°' }, 
+             { key: 'roll', label: 'Roll', unit: '°' }].forEach(s => {
+                container.innerHTML += `<div class="sensor-card"><span class="sensor-label">${s.label}</span><span class="sensor-value" id="sim-${s.key}">- ${s.unit}</span></div>`;
+            });
+        }
+    };
+    
+    createSensorDisplays();
+    init3DScene();
+    resetRotation();
+
+    // Set up button handlers - using the new command pattern
+    if (simConnectBtn) {
+        simConnectBtn.onclick = async () => {
+            const port = portSelect ? portSelect.value : currentPort;
+            const baud = baudSelect ? baudSelect.value : currentBaud;
+            if (isConnected) {
+                await disconnectSerial(simStatusId);
+            } else {
+                if (port) {
+                    await connectSerial(port, baud, simStatusId);
+                } else {
+                    showAlert('error', 'Connection Error', 'Please select a COM port first');
+                }
+            }
+        };
+    }
+
+    if (simStartBtn) {
+        simStartBtn.onclick = async () => {
+            console.log('Starting IMU streaming...');
+            
+            if (!isConnected) {
+                showAlert('error', 'Not Connected', 'Please connect to serial port first');
+                return;
+            }
+            
+            // Use the new command pattern for IMU command 'e'
+            await sendCommandWithPattern('e', simStatusId);
+            
+            const statusEl = document.getElementById(simStatusId);
+            if (statusEl) {
+                showStatus(statusEl, 'IMU streaming started (e command sent)', 'success');
+            }
+        };
+    }
+
+    if (resetViewBtn) resetViewBtn.onclick = () => { 
+        if (controls) controls.reset(); 
+        showToast('info', 'View Reset', 'Camera view has been reset to default', 2000);
+    };
+    
+    if (resetOrientationBtn) resetOrientationBtn.onclick = () => { 
+        resetRotation(); 
+        showToast('info', 'Orientation Reset', 'Drone orientation has been reset', 2000);
+    };
+    
+    if (toggleAxesBtn) toggleAxesBtn.onclick = () => { 
+        if (axesHelper) axesHelper.visible = isAxesVisible = !isAxesVisible; 
+        showToast('info', isAxesVisible ? 'Axes Shown' : 'Axes Hidden', 
+            isAxesVisible ? 'Coordinate axes are now visible' : 'Coordinate axes are now hidden', 2000);
+    };
+    
+    if (toggleRotationBtn) toggleRotationBtn.onclick = () => { 
+        useQuaternions = !useQuaternions; 
+        if (toggleRotationBtn) {
+            toggleRotationBtn.textContent = useQuaternions ? 'Quaternion Mode' : 'Euler Mode'; 
+        }
+        showToast('info', 'Rotation Mode Changed', 
+            useQuaternions ? 'Now using Quaternion rotation (smoother)' : 'Now using Euler rotation (direct)', 2000);
+    };
+    
+    if (smoothingSlider && smoothingValue) {
+        smoothingSlider.oninput = () => { 
+            rotationSmoothingFactor = parseFloat(smoothingSlider.value);
+            smoothingValue.textContent = rotationSmoothingFactor.toFixed(2); 
+            showToast('info', 'Smoothing Adjusted', `Rotation smoothing set to ${rotationSmoothingFactor.toFixed(2)}`, 1500);
+        };
+    }
+    
+    // Add data callback for simulator
+    addDataCallback(processSimulatorData);
+    
+    // Add raw data logging callback for debugging
+    addDataCallback((data) => {
+        console.log('Raw simulator data:', data.substring(0, 100));
+    });
+
+    // Update connection status
+    if (isConnected) {
+        updateConnectionStatus(simStatusId, `Connected to ${currentPort}`);
+    } else {
+        updateConnectionStatus(simStatusId, 'Disconnected - Connect to see real-time simulation');
+    }
+    
+    console.log('3D simulator initialization complete');
+}
+
+// ==================== DOM CONTENT LOADED INITIALIZATION ====================
+
+document.addEventListener('DOMContentLoaded', () => {
+    console.log('DOM Content Loaded - Initializing application');
+    
+    const hamburgerBtn = document.getElementById('hamburgerBtn');
+    const overlay = document.getElementById('overlay');
+    const navLinks = document.querySelectorAll('.nav-link');
+    
+    if (hamburgerBtn) hamburgerBtn.onclick = toggleSidebar;
+    if (overlay) overlay.onclick = closeSidebar;
+    
+    navLinks.forEach(link => {
+        link.onclick = (e) => {
+            e.preventDefault();
+            switchPage(link.getAttribute('href'));
+        };
+    });
+    
+    window.addEventListener('resize', () => {
+        if (window.innerWidth > 768) {
+            const overlay = document.getElementById('overlay');
+            if(overlay) overlay.classList.remove('active');
+        }
+        window.onWindowResize();
+    });
+
+    // Initial Page Load
+    console.log('Loading initial page...');
+    switchPage('#program-uploader');
+    
+    // Add global error handler
+    window.addEventListener('error', function(e) {
+        console.error('Global error:', e.error);
+    });
+});
+
+// Add automatic notifications for important events
+
+// Monitor connection status changes
+let lastConnectionStatus = isConnected;
+setInterval(() => {
+    if (isConnected !== lastConnectionStatus) {
+        if (isConnected) {
+            showConnectionNotification(true, currentPort);
+        } else {
+            showConnectionNotification(false, null, 'Connection lost');
+        }
+        lastConnectionStatus = isConnected;
+    }
+}, 1000);
+
+// Monitor serial data for errors
+function monitorSerialForErrors(data) {
+    if (data.includes('ERROR') || data.includes('FAIL') || data.includes('INVALID')) {
+        showToast('error', 'Device Error', 'Error detected in device output', 4000);
+    }
+    
+    if (data.includes('WARN') || data.includes('CAUTION')) {
+        showToast('warning', 'Device Warning', 'Warning from device', 3000);
+    }
+    
+    if (data.includes('OK') || data.includes('SUCCESS') || data.includes('READY')) {
+        showToast('success', 'Device Status', 'Device reported success', 2000);
+    }
+}
+
+// Add to your data callbacks
+addDataCallback(monitorSerialForErrors);
+
+// GPS lock notification
+let lastGpsStatus = false;
+function checkGpsStatus(gpsData) {
+    if (gpsData && gpsData.valid !== lastGpsStatus) {
+        if (gpsData.valid) {
+            showToast('success', 'GPS Lock', 
+                `GPS lock acquired with ${gpsData.satellites || 0} satellites`, 3000);
+        } else {
+            showToast('warning', 'GPS Lost', 'GPS signal lost', 3000);
+        }
+        lastGpsStatus = gpsData.valid;
+    }
+}
+
+</script>
+</body>
+</html>

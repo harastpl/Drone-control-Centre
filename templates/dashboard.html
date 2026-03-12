@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard Content</title>
+    <style>
+        /* RC Slider Styles */
+        .rc-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .rc-label {
+            width: 90px;
+            font-weight: bold;
+            color: #495057;
+        }
+        .slider-container {
+            flex-grow: 1;
+            height: 22px;
+            background-color: #f0f0f0;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+        }
+        .slider-fill {
+            height: 100%;
+            background-color: #28a745; /* Green */
+            width: 0%;
+            transition: width 0.1s linear;
+        }
+        .slider-text {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #8a2be2; /* purple */
+            font-weight: bold;
+            font-family: monospace;
+            text-shadow: 0px 0px 2px rgba(255, 255, 255, 0.8);
+            z-index: 2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Drone Diagnostic Dashboard</h2>
+        
+        <div class="section">
+            <h3>Connection Status</h3>
+            <div class="controls">
+                <button id="dashboardConnectBtn" class="connect-btn">Connect Serial</button>
+                <button id="dashboardClearBtn">Clear Log</button>
+                <div id="dashboardStatus" class="status info">Disconnected</div>
+            </div>
+        </div>
+      
+        <div class="dashboard-grid-layout">
+            
+            <div class="command-sidebar">
+                <h3>Diagnostic Commands</h3>
+                <button class="cmd-btn" data-cmd="a">RC Pulse Decoder</button>
+                <button class="cmd-btn" data-cmd="b">I2C Sensor Radar</button>
+                <button class="cmd-btn" data-cmd="c">Gyro Raw Stream</button>
+                <button class="cmd-btn" data-cmd="d">Accel Vector Feed</button>
+                <button class="cmd-btn" data-cmd="e">IMU Attitude</button>
+                <button class="cmd-btn" data-cmd="f">LED Status Check</button>
+                <button class="cmd-btn" data-cmd="g">Battery Monitor</button>
+                <button class="cmd-btn" data-cmd="h">Barometric Altimeter</button>
+                <button class="cmd-btn" data-cmd="i">GPS Module Test</button>
+                <button class="cmd-btn" data-cmd="j">Magnetometer Calibration</button>
+            </div>
+            
+            <div class="dashboard-center-stack">
+                
+                <div class="section">
+                    <h3>Real-time Data</h3>
+                    <div class="data-panels">
+                        <div class="data-panel" id="rcPanel">
+                            <h4>RC Pulse</h4>
+                            <div class="data-content">
+                                <div class="data-row" style="margin-bottom: 10px;">
+                                    <span class="data-label">Arm Status:</span>
+                                    <span class="data-value" id="armStatus">-</span>
+                                </div>
+                                
+                                <div class="rc-row">
+                                    <span class="rc-label">Roll:</span>
+                                    <div class="slider-container">
+                                        <div class="slider-fill" id="rollFill"></div>
+                                        <span class="slider-text" id="rollText">0%</span>
+                                    </div>
+                                </div>
+
+                                <div class="rc-row">
+                                    <span class="rc-label">Pitch:</span>
+                                    <div class="slider-container">
+                                        <div class="slider-fill" id="pitchFill"></div>
+                                        <span class="slider-text" id="pitchText">0%</span>
+                                    </div>
+                                </div>
+
+                                <div class="rc-row">
+                                    <span class="rc-label">Throttle:</span>
+                                    <div class="slider-container">
+                                        <div class="slider-fill" id="throttleFill"></div>
+                                        <span class="slider-text" id="throttleText">0%</span>
+                                    </div>
+                                </div>
+
+                                <div class="rc-row">
+                                    <span class="rc-label">Yaw:</span>
+                                    <div class="slider-container">
+                                        <div class="slider-fill" id="yawFill"></div>
+                                        <span class="slider-text" id="yawText">0%</span>
+                                    </div>
+                                </div>
+
+                                <div class="rc-row">
+                                    <span class="rc-label">CH5 (Mode):</span>
+                                    <div class="slider-container">
+                                        <div class="slider-fill" id="ch5Fill"></div>
+                                        <span class="slider-text" id="ch5Text">0%</span>
+                                    </div>
+                                </div>
+
+                                <div class="rc-row">
+                                    <span class="rc-label">CH6 (Aux):</span>
+                                    <div class="slider-container">
+                                        <div class="slider-fill" id="ch6Fill"></div>
+                                        <span class="slider-text" id="ch6Text">0%</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="data-panel" id="imuPanel">
+                            <h4>IMU Attitude</h4>
+                            <div class="data-content">
+                                <div class="data-row"><span class="data-label">Pitch:</span><span class="data-value" id="pitchAngle">-</span></div>
+                                <div class="data-row"><span class="data-label">Roll:</span><span class="data-value" id="rollAngle">-</span></div>
+                                <div class="data-row"><span class="data-label">Yaw:</span><span class="data-value" id="yawAngle">-</span></div>
+                                <div class="data-row"><span class="data-label">Temp:</span><span class="data-value" id="imuTemp">-</span></div>
+                            </div>
+                        </div>
+                        <div class="data-panel" id="batteryPanel">
+                            <h4>Battery Monitor</h4>
+                            <div class="data-content">
+                                <div class="data-row"><span class="data-label">Voltage:</span><span class="data-value" id="batteryVoltage">-</span></div>
+                            </div>
+                        </div>
+                        <div class="data-panel" id="gyroPanel">
+                            <h4>Gyro Raw Data</h4>
+                            <div class="data-content">
+                                <div class="data-row"><span class="data-label">Gyro X:</span><span class="data-value" id="gyroX">-</span></div>
+                                <div class="data-row"><span class="data-label">Gyro Y:</span><span class="data-value" id="gyroY">-</span></div>
+                                <div class="data-row"><span class="data-label">Gyro Z:</span><span class="data-value" id="gyroZ">-</span></div>
+                            </div>
+                        </div>
+                        <div class="data-panel" id="accelPanel">
+                            <h4>Accelerometer</h4>
+                            <div class="data-content">
+                                <div class="data-row"><span class="data-label">Accel X:</span><span class="data-value" id="accelX">-</span></div>
+                                <div class="data-row"><span class="data-label">Accel Y:</span><span class="data-value" id="accelY">-</span></div>
+                                <div class="data-row"><span class="data-label">Accel Z:</span><span class="data-value" id="accelZ">-</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2>PID Gain Setting</h2>
+                    <div class="controls" style="margin-bottom: 20px;">
+                        <button id="readAllPidBtn">Read All Gains </button>
+                        <button id="writeAllPidBtn">Write Selected Gains </button>
+                        <p class="status info" style="margin-left: 10px;">select Checkboxes whose values you want to write.</p>
+                    </div>
+                    
+                    <div class="pid-grid">
+                        
+                        <div class="pid-card">
+                            <h4>Roll PID Gains</h4>
+                            <div class="pid-row">
+                                <label for="roll-p"><b>P-Gain:</b></label>
+                                <input type="number" step="0.01" id="roll-p" data-pid-var="pid_p_gain_roll" value="1.0">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="roll-i"><b>I-Gain:</b></label>
+                                <input type="number" step="0.01" id="roll-i" data-pid-var="pid_i_gain_roll" value="0.04">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="roll-d"><b>D-Gain:</b></label>
+                                <input type="number" step="0.01" id="roll-d" data-pid-var="pid_d_gain_roll" value="0.1">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="roll-max"><b>Max Output:</b></label>
+                                <input type="number" step="1" id="roll-max" data-pid-var="pid_max_roll" value="400">
+                                <input type="checkbox">
+                            </div>
+                        </div>
+
+                        <div class="pid-card">
+                            <h4>Pitch PID Gains</h4>
+                            <div class="pid-row">
+                                <label for="pitch-p"><b>P-Gain:</b></label>
+                                <input type="number" step="0.01" id="pitch-p" data-pid-var="pid_p_gain_pitch" value="1.0">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="pitch-i"><b>I-Gain:</b></label>
+                                <input type="number" step="0.01" id="pitch-i" data-pid-var="pid_i_gain_pitch" value="0.04">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="pitch-d"><b>D-Gain:</b></label>
+                                <input type="number" step="0.01" id="pitch-d" data-pid-var="pid_d_gain_pitch" value="0.1">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="pitch-max"><b>Max Output:</b></label>
+                                <input type="number" step="1" id="pitch-max" data-pid-var="pid_max_pitch" value="400">
+                                <input type="checkbox">
+                            </div>
+                        </div>
+                        
+                        <div class="pid-card">
+                            <h4>Yaw PID Gains</h4>
+                            <div class="pid-row">
+                                <label for="yaw-p"><b>P-Gain:</b></label>
+                                <input type="number" step="0.01" id="yaw-p" data-pid-var="pid_p_gain_yaw" value="4.0">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="yaw-i"><b>I-Gain:</b></label>
+                                <input type="number" step="0.01" id="yaw-i" data-pid-var="pid_i_gain_yaw" value="0.02">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="yaw-d"><b>D-Gain:</b></label>
+                                <input type="number" step="0.01" id="yaw-d" data-pid-var="pid_d_gain_yaw" value="0.0">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="yaw-max"><b>Max Output:</b></label>
+                                <input type="number" step="1" id="yaw-max" data-pid-var="pid_max_yaw" value="400">
+                                <input type="checkbox">
+                            </div>
+                        </div>
+
+                        <div class="pid-card">
+                            <h4>Altitude & GPS Gains</h4>
+                            <div class="pid-row">
+                                <label for="alt-p">Alt P-Gain:</label>
+                                <input type="number" step="0.01" id="alt-p" data-pid-var="pid_p_gain_altitude" value="1.4">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="alt-i">Alt I-Gain:</label>
+                                <input type="number" step="0.01" id="alt-i" data-pid-var="pid_i_gain_altitude" value="0.2">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="alt-d">Alt D-Gain:</label>
+                                <input type="number" step="0.01" id="alt-d" data-pid-var="pid_d_gain_altitude" value="0.75">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="alt-max">Alt Max Output:</label>
+                                <input type="number" step="1" id="alt-max" data-pid-var="pid_max_altitude" value="400">
+                                <input type="checkbox">
+                            </div>
+                            <hr style="margin: 10px 0;">
+                            <div class="pid-row">
+                                <label for="gps-p">GPS P-Gain:</label>
+                                <input type="number" step="0.01" id="gps-p" data-pid-var="gps_p_gain" value="2.7">
+                                <input type="checkbox">
+                            </div>
+                            <div class="pid-row">
+                                <label for="gps-d">GPS D-Gain:</label>
+                                <input type="number" step="0.01" id="gps-d" data-pid-var="gps_d_gain" value="6.5">
+                                <input type="checkbox">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Raw Data Log</h3>
+                    <div class="log-container" id="dashboardLog"></div>
+                </div>
+            </div>
+            
+            <div class="motor-sidebar">
+                <div class="danger-zone">
+                    <h3 style="color: #dc3545;"> MOTOR TEST BENCH (DANGER ZONE - PROPS OFF!)</h3>
+                    <div style="margin-top: 15px;">
+                        <button class="motor-btn danger" data-cmd="1">Motor 1 (FR-CCW)</button>
+                        <button class="motor-btn danger" data-cmd="2">Motor 2 (RR-CW)</button>
+                        <button class="motor-btn danger" data-cmd="3">Motor 3 (RL-CCW)</button>
+                        <button class="motor-btn danger" data-cmd="4">Motor 4 (FL-CW)</button>
+                        <button class="motor-btn danger" data-cmd="5">All Motors Sync Test</button>
+                        <div style="margin-top: 10px;">
+                            <button class="stop-btn" data-cmd="q"> STOP ALL MOTORS</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+    </div>
+</body>
+</html>

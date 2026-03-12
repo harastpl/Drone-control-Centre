@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Program Uploader Content</title>
+</head>
+<body>
+    <div class="container">
+        <h1>Drone Firmware Uploader</h1>
+        
+        <div class="section">
+            <h2>Firmware Upload</h2>
+            <div class="form-group">
+                <label for="port">COM Port:</label>
+                <select id="port">
+                    <option value="">Select port...</option>
+                </select>
+                <button id="refreshPorts">↻</button>
+                
+                <label for="baud">Baud:</label>
+                <select id="baud">
+                    <option value="9600">9600</option>
+                    <option value="19200">19200</option>
+                    <option value="38400">38400</option>
+                    <option value="57600" selected>57600</option>
+                    <option value="115200">115200</option>
+                    <option value="230400">230400</option>
+                    <option value="460800">460800</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="fileType">File Type:</label>
+                <select id="fileType">
+                    <option value="hex">hex</option>
+                    <option value="bin" selected>bin</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="firmwareFile">File:</label>
+                <input type="file" id="firmwareFile" accept=".hex,.bin">
+            </div>
+            
+            <div class="progress">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            
+            <button id="uploadBtn">Upload Firmware</button>
+            <div id="uploadStatus"></div>
+        </div>
+
+        <div class="section">
+            <h2>Serial Monitor</h2>
+            <div class="controls">
+                <button id="connectBtn" class="connect-btn">Connect</button>
+                <button id="clearBtn">Clear</button>
+                <div id="serialStatus" class="status info">Disconnected</div>
+            </div>
+            
+            <div class="log-container" id="serialLog"></div>
+            
+            <div class="send-controls">
+                <input type="text" id="sendMessage" placeholder="Enter message to send...">
+                <select id="lineEnding">
+                    <option value="none">None</option>
+                    <option value="lf">LF</option>
+                    <option value="cr">CR</option>
+                    <option value="crlf">CR+LF</option>
+                    <option value="hex">HEX</option>
+                </select>
+                <button id="sendBtn">Send</button>
+                <button id="sendNewlineBtn">Send+NL</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
